@@ -617,6 +617,10 @@ class PriceAnalyzer:
         Returns:
             :class:`UndervaluedResult` с деталями анализа.
         """
+        # Получаем настройки
+        settings = get_settings()
+        discount_threshold = settings.MEDIAN_DISCOUNT_THRESHOLD
+
         # Инициализация результата
         result = UndervaluedResult(
             is_undervalued=False,
@@ -653,8 +657,14 @@ class PriceAnalyzer:
             result.score_z = min(1.0, abs(z_score) / 3.0)
 
         # Процент от медианы (вес 0.3)
-        if median > 0 and price < median * 0.85:
+        if median > 0 and price < median * discount_threshold:
             result.score_pct = (median - price) / median
+
+        # Обязательное условие: цена должна быть ниже медианы на порог %
+        # Если цена выше или равна порогу, товар НЕ считается undervalued
+        price_below_threshold = False
+        if median > 0:
+            price_below_threshold = price < median * discount_threshold
 
         # Итоговый score
         result.score = (
@@ -663,8 +673,10 @@ class PriceAnalyzer:
             + 0.3 * result.score_pct
         )
 
-        # Порог
-        result.is_undervalued = result.score >= 0.3
+        # Товар считается undervalued ТОЛЬКО если:
+        # 1. Составной score >= 0.3
+        # 2. Цена ниже медианы на порог % (ОБЯЗАТЕЛЬНОЕ условие)
+        result.is_undervalued = result.score >= 0.3 and price_below_threshold
 
         self._log.debug(
             "detect_undervalued_v2",

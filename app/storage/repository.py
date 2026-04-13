@@ -509,10 +509,13 @@ class Repository:
         try:
             stmt = (
                 select(NotificationSent)
-                .where(NotificationSent.ad_id == ad_id)
-                .where(NotificationSent.notification_type == notification_type)
+                .where(
+                    NotificationSent.ad_id == ad_id,
+                    NotificationSent.notification_type == notification_type,
+                )
+                .limit(1)
             )
-            result = self.session.execute(stmt).scalar_one_or_none()
+            result = self.session.scalar(stmt)
             sent = result is not None
             logger.debug(
                 "notification_sent_check",
@@ -547,6 +550,15 @@ class Repository:
         Raises:
             StorageError: Ошибка при работе с БД.
         """
+        # Проверяем, не отправлено ли уже
+        if self.is_notification_sent(ad_id, notification_type):
+            logger.debug(
+                "notification_already_sent_skip",
+                ad_id=ad_id,
+                notification_type=notification_type,
+            )
+            return
+
         try:
             notification = NotificationSent(
                 ad_id=ad_id,
@@ -555,11 +567,22 @@ class Repository:
             )
             self.session.add(notification)
             self.session.flush()
+            # Немедленный коммит для гарантии, что запись NotificationSent
+            # зафиксирована в БД до фактической отправки уведомления.
+            self.session.commit()
             logger.info(
                 "notification_marked_sent",
                 ad_id=ad_id,
                 notification_type=notification_type,
                 telegram_message_id=telegram_message_id,
+            )
+        except IntegrityError:
+            # Дубль на уровне БД — откатываем и игнорируем
+            self.session.rollback()
+            logger.debug(
+                "notification_duplicate_integrity",
+                ad_id=ad_id,
+                notification_type=notification_type,
             )
         except SQLAlchemyError as exc:
             logger.error(

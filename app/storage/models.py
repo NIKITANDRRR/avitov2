@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -283,6 +284,9 @@ class NotificationSent(Base):
     """
 
     __tablename__ = "notifications_sent"
+    __table_args__ = (
+        UniqueConstraint("ad_id", "notification_type", name="uq_notification_ad_type"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ad_id: Mapped[int] = mapped_column(

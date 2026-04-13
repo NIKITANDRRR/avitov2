@@ -721,6 +721,12 @@ class Pipeline:
 
         self.stats["ads_undervalued"] = len(all_undervalued)
 
+        # Фиксируем аналитические данные в БД до отправки уведомлений,
+        # чтобы записи NotificationSent (из mark_notification_sent) были
+        # закоммичены до фактической отправки через Telegram/Email.
+        repo.commit()
+        self.logger.info("analysis_committed_before_notifications")
+
         # Отправка уведомлений
         await self._send_notifications(all_undervalued, repo)
 

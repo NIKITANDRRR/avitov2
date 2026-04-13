@@ -1,5 +1,6 @@
 """Модуль анализа цен и определения недооценённых объявлений."""
 
+from app.analysis.accessory_filter import AccessoryFilter, FilterResult
 from app.analysis.analyzer import (
     AdAnalysisResult,
     MarketStats,
@@ -9,7 +10,9 @@ from app.analysis.analyzer import (
 )
 
 __all__ = [
+    "AccessoryFilter",
     "AdAnalysisResult",
+    "FilterResult",
     "MarketStats",
     "PriceAnalyzer",
     "UndervaluedAd",

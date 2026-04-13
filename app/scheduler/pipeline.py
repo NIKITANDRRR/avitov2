@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 
 import structlog
@@ -14,6 +15,7 @@ from app.parser import parse_search_page, parse_ad_page, SearchResultItem, AdDat
 from app.storage import Repository, get_session
 from app.storage.models import TrackedSearch
 from app.analysis import PriceAnalyzer, UndervaluedAd, AdAnalysisResult
+from app.analysis.accessory_filter import AccessoryFilter
 from app.notifier import EmailNotifier, TelegramNotifier
 from app.utils import random_delay, setup_logging, extract_ad_id_from_url, normalize_url
 
@@ -44,6 +46,7 @@ class Pipeline:
             "ads_scraped": 0,
             "ads_parsed": 0,
             "ads_undervalued": 0,
+            "ads_filtered": 0,
             "notifications_sent": 0,
             "errors": 0,
         }
@@ -404,6 +407,17 @@ class Pipeline:
                 items_found=len(search_items),
             )
 
+            # Ранняя фильтрация аксессуаров (до сбора карточек)
+            search_items, early_filtered = self._early_filter_search_items(search_items)
+            if early_filtered > 0:
+                self.stats["ads_filtered"] += early_filtered
+                self.logger.info(
+                    "search_items_early_filtered",
+                    search_url=search_url,
+                    filtered_count=early_filtered,
+                    remaining=len(search_items),
+                )
+
             # Фильтрация уже известных
             recent_ids = repo.get_recent_ad_ids(search_url)
             known_items: list[SearchResultItem] = []
@@ -574,8 +588,9 @@ class Pipeline:
 
         Для каждого поискового URL:
             1. Получить все объявления.
-            2. Запустить ценовой анализ.
-            3. Собрать недооценённые объявления.
+            2. Отфильтровать аксессуары.
+            3. Запустить ценовой анализ.
+            4. Собрать недооценённые объявления.
 
         Затем отправить уведомления через Telegram.
 
@@ -585,6 +600,12 @@ class Pipeline:
         all_undervalued: list[UndervaluedAd] = []
 
         price_analyzer = PriceAnalyzer()
+        accessory_filter = AccessoryFilter(
+            blacklist=self.settings.ACCESSORY_BLACKLIST,
+            min_price=self.settings.MIN_PRICE_FILTER,
+            price_ratio=self.settings.ACCESSORY_PRICE_RATIO_THRESHOLD,
+            enabled=self.settings.ENABLE_ACCESSORY_FILTER,
+        )
 
         for search_url in self.settings.SEARCH_URLS:
             try:
@@ -596,13 +617,39 @@ class Pipeline:
                     )
                     continue
 
-                undervalued = price_analyzer.analyze_and_mark(ads, repo)
+                # Фильтрация аксессуаров
+                filtered_count = 0
+                filtered_ads = []
+                for ad in ads:
+                    filter_result = accessory_filter.is_accessory(ad, median_price=None)
+                    if filter_result.is_filtered:
+                        filtered_count += 1
+                        self.logger.info(
+                            "ad_filtered_as_accessory",
+                            extra={"ad_id": ad.ad_id, "title": getattr(ad, 'title', ''), "reason": filter_result.reason},
+                        )
+                        continue
+                    filtered_ads.append(ad)
+
+                self.stats["ads_filtered"] += filtered_count
+
+                if not filtered_ads:
+                    self.logger.info(
+                        "all_ads_filtered_as_accessories",
+                        search_url=search_url,
+                        filtered_count=filtered_count,
+                    )
+                    continue
+
+                undervalued = price_analyzer.analyze_and_mark(filtered_ads, repo)
                 all_undervalued.extend(undervalued)
 
                 self.logger.info(
                     "analysis_completed",
                     search_url=search_url,
                     total_ads=len(ads),
+                    filtered_as_accessory=filtered_count,
+                    analyzed_ads=len(filtered_ads),
                     undervalued=len(undervalued),
                 )
 
@@ -629,9 +676,10 @@ class Pipeline:
 
         Для каждого отслеживаемого поиска:
             1. Получить объявления за ``TEMPORAL_WINDOW_DAYS``.
-            2. Проанализировать каждое объявление через ``analyzer.analyze_ad()``.
-            3. Обновить аналитические поля в БД.
-            4. Собрать недооценённые объявления.
+            2. Отфильтровать аксессуары и мелочёвку.
+            3. Проанализировать каждое объявление через ``analyzer.analyze_ad()``.
+            4. Обновить аналитические поля в БД.
+            5. Собрать недооценённые объявления.
 
         Args:
             repo: Экземпляр репозитория.
@@ -639,6 +687,13 @@ class Pipeline:
             analyzer: Экземпляр анализатора цен.
         """
         all_undervalued: list[UndervaluedAd] = []
+
+        accessory_filter = AccessoryFilter(
+            blacklist=self.settings.ACCESSORY_BLACKLIST,
+            min_price=self.settings.MIN_PRICE_FILTER,
+            price_ratio=self.settings.ACCESSORY_PRICE_RATIO_THRESHOLD,
+            enabled=self.settings.ENABLE_ACCESSORY_FILTER,
+        )
 
         for search in searches:
             try:
@@ -653,14 +708,40 @@ class Pipeline:
                     )
                     continue
 
-                # Анализируем каждое объявление через v2
+                # Фильтрация аксессуаров
+                filtered_count = 0
+                filtered_ads = []
                 for ad in ads:
                     if ad.price is None or ad.price <= 0:
                         continue
 
+                    filter_result = accessory_filter.is_accessory(ad, median_price=None)
+                    if filter_result.is_filtered:
+                        filtered_count += 1
+                        self.logger.info(
+                            "ad_filtered_as_accessory",
+                            ad_id=ad.ad_id,
+                            title=getattr(ad, 'title', ''),
+                            reason=filter_result.reason,
+                        )
+                        continue
+                    filtered_ads.append(ad)
+
+                self.stats["ads_filtered"] += filtered_count
+
+                if not filtered_ads:
+                    self.logger.info(
+                        "all_ads_filtered_as_accessories",
+                        search_url=search.search_url,
+                        filtered_count=filtered_count,
+                    )
+                    continue
+
+                # Анализируем каждое объявление через v2
+                for ad in filtered_ads:
                     try:
                         result: AdAnalysisResult | None = analyzer.analyze_ad(
-                            ad, ads,
+                            ad, filtered_ads,
                         )
                         if result is None:
                             continue
@@ -705,6 +786,8 @@ class Pipeline:
                     "analysis_completed_for_search",
                     search_url=search.search_url,
                     total_ads=len(ads),
+                    filtered_as_accessory=filtered_count,
+                    analyzed_ads=len(filtered_ads),
                     undervalued=len(
                         [u for u in all_undervalued
                          if u.ad.search_url == search.search_url]
@@ -729,6 +812,87 @@ class Pipeline:
 
         # Отправка уведомлений
         await self._send_notifications(all_undervalued, repo)
+
+    def _early_filter_search_items(
+        self,
+        items: list[SearchResultItem],
+    ) -> tuple[list[SearchResultItem], int]:
+        """Ранняя фильтрация элементов поиска по цене и стоп-словам.
+
+        Фильтрует на этапе поисковой выдачи (до сбора карточек),
+        чтобы сэкономить ресурсы браузера. Проверяет:
+        1. Минимальную цену (по price_str, если удалось извлечь число).
+        2. Чёрный список слов в названии.
+
+        Args:
+            items: Список элементов из поисковой выдачи.
+
+        Returns:
+            Кортеж (отфильтрованный список, количество отсеянных).
+        """
+        if not self.settings.ENABLE_ACCESSORY_FILTER:
+            return items, 0
+
+        blacklist = [w.lower().strip() for w in self.settings.ACCESSORY_BLACKLIST if w.strip()]
+        min_price = self.settings.MIN_PRICE_FILTER
+
+        kept: list[SearchResultItem] = []
+        filtered = 0
+
+        for item in items:
+            # Проверка по стоп-словам в названии
+            title_lower = (item.title or "").lower()
+            skip = False
+            for word in blacklist:
+                if word in title_lower:
+                    self.logger.info(
+                        "search_item_filtered_blacklist",
+                        ad_id=item.ad_id,
+                        title=item.title,
+                        reason=f"Стоп-слово '{word}' в названии",
+                    )
+                    skip = True
+                    break
+
+            if skip:
+                filtered += 1
+                continue
+
+            # Проверка по минимальной цене (если удалось извлечь число)
+            if item.price_str and min_price > 0:
+                price_num = self._extract_price_number(item.price_str)
+                if price_num is not None and price_num < min_price:
+                    self.logger.info(
+                        "search_item_filtered_min_price",
+                        ad_id=item.ad_id,
+                        title=item.title,
+                        price=price_num,
+                        reason=f"Цена {price_num}₽ ниже минимальной {min_price}₽",
+                    )
+                    filtered += 1
+                    continue
+
+            kept.append(item)
+
+        return kept, filtered
+
+    @staticmethod
+    def _extract_price_number(price_str: str) -> int | None:
+        """Извлечь числовое значение цены из строки.
+
+        Args:
+            price_str: Строка цены (например «15 000 ₽», «15000»).
+
+        Returns:
+            Числовое значение цены или None.
+        """
+        if not price_str:
+            return None
+        # Удаляем всё кроме цифр
+        digits = re.sub(r"\D", "", price_str)
+        if digits:
+            return int(digits)
+        return None
 
     async def _send_notifications(
         self,

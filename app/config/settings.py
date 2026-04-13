@@ -154,6 +154,39 @@ class Settings(BaseSettings):
         description="Порог % от медианы для недооценённости",
     )
 
+    # === Фильтрация аксессуаров ===
+    ENABLE_ACCESSORY_FILTER: bool = Field(
+        default=True,
+        description="Включить фильтрацию аксессуаров и мелочевки"
+    )
+    MIN_PRICE_FILTER: int = Field(
+        default=5000,
+        description="Минимальная цена товара для анализа (руб.)"
+    )
+    ACCESSORY_BLACKLIST: list[str] = Field(
+        default=[
+            "чехол", "case", "кейс", "сумка",
+            "шлейф", "кабель", "провод",
+            "матрица", "экран", "дисплей",
+            "блок питания", "зарядк", "адаптер", "power adapter",
+            "клавиатура", "keyboard",
+            "игр", "game",
+            "стилус", "pen", "pencil",
+            "подставк", "держатель", "mount",
+            "защитн", "плёнк", "стекло", "protector",
+            "мышь", "mouse", "трекпад",
+            "ремешок", "браслет",
+            "наушник", "airpods pro",
+            "аккумулятор", "battery",
+            "винт", "болт", "креплени",
+        ],
+        description="Чёрный список слов в названии для фильтрации аксессуаров"
+    )
+    ACCESSORY_PRICE_RATIO_THRESHOLD: float = Field(
+        default=0.3,
+        description="Если цена < 30% медианы сегмента — вероятный аксессуар"
+    )
+
     # === Параметры масштабирования поиска ===
     MAX_CONCURRENT_SEARCHES: int = Field(
         default=3,

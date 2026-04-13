@@ -35,6 +35,10 @@ class TrackedSearch(Base):
         search_url: URL поисковой выдачи Avito.
         search_phrase: Человекочитаемое название/описание поиска.
         is_active: Флаг активности поиска.
+        schedule_interval_hours: Интервал запуска в часах.
+        last_run_at: Время последнего запуска.
+        priority: Приоритет поиска (выше = важнее).
+        max_ads_to_parse: Сколько карточек парсить за один запуск.
         created_at: Дата-время создания записи.
         updated_at: Дата-время последнего обновления записи.
         runs: Связанные запуски поиска (one-to-many).
@@ -48,6 +52,16 @@ class TrackedSearch(Base):
     )
     search_phrase: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    schedule_interval_hours: Mapped[int] = mapped_column(
+        Integer, default=2, nullable=False,
+    )
+    last_run_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True,
+    )
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_ads_to_parse: Mapped[int] = mapped_column(
+        Integer, default=3, nullable=False,
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=_utcnow,
     )
@@ -139,6 +153,7 @@ class Ad(Base):
         price: Цена.
         location: Местоположение.
         seller_name: Имя продавца.
+        seller_type: Тип продавца («частный», «магазин», «компания» и т.д.).
         condition: Состояние товара.
         publication_date: Дата публикации объявления.
         search_url: URL поиска, откуда найдено объявление.
@@ -146,6 +161,9 @@ class Ad(Base):
         last_scraped_at: Дата-время последнего скрейпинга.
         is_undervalued: Флаг недооценённости.
         undervalue_score: Отклонение от медианы (например -0.15 = 15% ниже).
+        z_score: Z-score цена относительно сегмента.
+        iqr_outlier: Является ли выбросом по IQR.
+        segment_key: Ключ сегмента вида «{condition}_{location}_{seller_type}».
         parse_status: Статус парсинга (pending/parsed/failed).
         last_error: Текст последней ошибки парсинга.
         snapshots: Связанные снимки цен (one-to-many).
@@ -165,6 +183,7 @@ class Ad(Base):
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     location: Mapped[str | None] = mapped_column(String(256), nullable=True)
     seller_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    seller_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     condition: Mapped[str | None] = mapped_column(String(128), nullable=True)
     publication_date: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, nullable=True,
@@ -180,6 +199,9 @@ class Ad(Base):
     )
     is_undervalued: Mapped[bool] = mapped_column(Boolean, default=False)
     undervalue_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    z_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    iqr_outlier: Mapped[bool] = mapped_column(Boolean, default=False)
+    segment_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     parse_status: Mapped[str] = mapped_column(String(20), default="pending")
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 

@@ -23,10 +23,7 @@ env/
 *.swo
 
 # Data files (raw HTML, sessions, databases)
-data/raw_html/
-data/*.session
-data/*.db
-data/*.sqlite
+data/
 
 # OS
 .DS_Store

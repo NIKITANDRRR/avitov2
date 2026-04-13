@@ -114,6 +114,76 @@ class Settings(BaseSettings):
     # Analysis
     UNDERVALUE_THRESHOLD: float = Field(default=0.8, gt=0.0, lt=1.0)
 
+    # === Параметры фильтрации аномалий ===
+    TRIM_PERCENT: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.5,
+        description="Доля отбрасываемых выбросов с каждого края (5%)",
+    )
+    IQR_MULTIPLIER: float = Field(
+        default=1.5,
+        ge=0.0,
+        description="Множитель для IQR fences",
+    )
+    TEMPORAL_WINDOW_DAYS: int = Field(
+        default=14,
+        ge=1,
+        description="Окно анализа в днях",
+    )
+    MIN_SEGMENT_SIZE: int = Field(
+        default=3,
+        ge=1,
+        description="Минимальный размер сегмента для анализа",
+    )
+    UNDERVALUED_THRESHOLD: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Порог composite score для недооценённости",
+    )
+    ZSCORE_THRESHOLD: float = Field(
+        default=1.5,
+        ge=0.0,
+        description="Порог z-score для аномалий",
+    )
+    MEDIAN_DISCOUNT_THRESHOLD: float = Field(
+        default=0.85,
+        gt=0.0,
+        le=1.0,
+        description="Порог % от медианы для недооценённости",
+    )
+
+    # === Параметры масштабирования поиска ===
+    MAX_CONCURRENT_SEARCHES: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Макс. параллельных поисков в батче",
+    )
+    DEFAULT_SCHEDULE_INTERVAL_HOURS: int = Field(
+        default=2,
+        ge=1,
+        le=48,
+        description="Интервал запуска по умолчанию (часы)",
+    )
+    DEFAULT_MAX_ADS_TO_PARSE: int = Field(
+        default=3,
+        ge=1,
+        le=50,
+        description="Карточек на поиск за запуск по умолчанию",
+    )
+    BATCH_DELAY_SECONDS: int = Field(
+        default=30,
+        ge=0,
+        description="Задержка между батчами поисков (сек)",
+    )
+    SEARCH_DELAY_SECONDS: int = Field(
+        default=5,
+        ge=0,
+        description="Задержка между поисками в батче (сек)",
+    )
+
     # Storage
     RAW_HTML_PATH: str = Field(default="data/raw_html")
 

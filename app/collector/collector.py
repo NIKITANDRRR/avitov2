@@ -7,6 +7,8 @@ from datetime import datetime
 
 import structlog
 
+from playwright.async_api import Error as PlaywrightError
+
 from app.collector.browser import BrowserManager
 from app.config.settings import Settings
 from app.utils.exceptions import CollectorError
@@ -99,6 +101,16 @@ class AvitoCollector:
 
             return html, saved_path
 
+        except PlaywrightError as exc:
+            # TargetClosedError и другие ошибки Playwright — страница закрыта
+            self.logger.warning(
+                "search_page_browser_error",
+                url=url,
+                error=str(exc),
+            )
+            raise CollectorError(
+                f"Failed to collect search page {url}: {exc}"
+            ) from exc
         except Exception as exc:
             # Пытаемся сохранить HTML для отладки даже при ошибке
             try:
@@ -113,7 +125,10 @@ class AvitoCollector:
                 f"Failed to collect search page {url}: {exc}"
             ) from exc
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     async def collect_ad_page(self, url: str) -> tuple[str, str]:
         """Открыть карточку объявления и вернуть ``(html, saved_path)``.
@@ -173,6 +188,16 @@ class AvitoCollector:
 
             return html, saved_path
 
+        except PlaywrightError as exc:
+            # TargetClosedError и другие ошибки Playwright — страница закрыта
+            self.logger.warning(
+                "ad_page_browser_error",
+                url=url,
+                error=str(exc),
+            )
+            raise CollectorError(
+                f"Failed to collect ad page {url}: {exc}"
+            ) from exc
         except Exception as exc:
             # Пытаемся сохранить HTML для отладки даже при ошибке
             try:
@@ -187,7 +212,10 @@ class AvitoCollector:
                 f"Failed to collect ad page {url}: {exc}"
             ) from exc
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     async def _wait_for_selectors(
         self,
@@ -219,6 +247,13 @@ class AvitoCollector:
                 return True
             except PlaywrightTimeout:
                 continue
+            except PlaywrightError:
+                # TargetClosedError — страница/контекст/браузер закрыты
+                self.logger.warning(
+                    "selector_wait_page_closed",
+                    selector=selector,
+                )
+                return False
             except Exception:
                 continue
 

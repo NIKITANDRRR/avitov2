@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import structlog
@@ -268,7 +268,23 @@ class Repository:
 
             ad = Ad(ad_id=ad_id, url=url, search_url=search_url)
             self.session.add(ad)
-            self.session.flush()
+            try:
+                self.session.flush()
+            except IntegrityError:
+                # Race condition: другой параллельный запрос уже вставил эту запись
+                self.session.rollback()
+                stmt = select(Ad).where(Ad.ad_id == ad_id)
+                existing = self.session.execute(stmt).scalar_one_or_none()
+                if existing is not None:
+                    logger.info(
+                        "ad_created_by_another_thread",
+                        ad_id=ad_id,
+                        db_id=existing.id,
+                    )
+                    return existing, False
+                # Если всё ещё не найден — пробросим оригинальную ошибку
+                raise
+
             logger.info(
                 "ad_created",
                 ad_id=ad_id,
@@ -276,6 +292,15 @@ class Repository:
                 search_url=search_url,
             )
             return ad, True
+        except IntegrityError as exc:
+            logger.error(
+                "get_or_create_ad_integrity_error",
+                ad_id=ad_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get or create ad (integrity): {exc}"
+            ) from exc
         except SQLAlchemyError as exc:
             logger.error(
                 "get_or_create_ad_failed",
@@ -544,6 +569,230 @@ class Repository:
             )
             raise StorageError(
                 f"Failed to mark notification sent: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Сегментация и аналитика
+    # ------------------------------------------------------------------
+
+    def get_ads_by_segment(
+        self, segment_key: str, days: int = 14,
+    ) -> list[Ad]:
+        """Возвращает объявления по сегменту за последние N дней.
+
+        Args:
+            segment_key: Ключ сегмента вида «{condition}_{location}_{seller_type}».
+            days: Количество дней для поиска.
+
+        Returns:
+            list[Ad]: Список объявлений в сегменте.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            stmt = (
+                select(Ad)
+                .where(Ad.segment_key == segment_key)
+                .where(Ad.first_seen_at >= cutoff)
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "ads_by_segment_fetched",
+                segment_key=segment_key,
+                days=days,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_ads_by_segment_failed",
+                segment_key=segment_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get ads by segment: {exc}"
+            ) from exc
+
+    def get_ads_for_analysis(
+        self, search_url: str, days: int = 14,
+    ) -> list[Ad]:
+        """Возвращает все объявления для анализа с фильтром по давности.
+
+        Выбирает объявления с валидной ценой (price IS NOT NULL AND price > 0)
+        и датой первого обнаружения не старше N дней.
+
+        Args:
+            search_url: URL поисковой выдачи.
+            days: Количество дней для поиска.
+
+        Returns:
+            list[Ad]: Список объявлений для анализа.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            stmt = (
+                select(Ad)
+                .where(Ad.search_url == search_url)
+                .where(Ad.first_seen_at >= cutoff)
+                .where(Ad.price.is_not(None))
+                .where(Ad.price > 0)
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "ads_for_analysis_fetched",
+                search_url=search_url,
+                days=days,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_ads_for_analysis_failed",
+                search_url=search_url,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get ads for analysis: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Планирование запусков
+    # ------------------------------------------------------------------
+
+    def get_searches_due_for_run(self) -> list[TrackedSearch]:
+        """Возвращает поиски, которые пора запускать.
+
+        Выбирает активные поиски, у которых:
+        - last_run_at IS NULL (никогда не запускался), либо
+        - last_run_at + schedule_interval_hours <= now()
+
+        Результаты отсортированы по приоритету (по убыванию).
+
+        Returns:
+            list[TrackedSearch]: Список поисков, готовых к запуску.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            now = datetime.datetime.utcnow()
+            stmt = (
+                select(TrackedSearch)
+                .where(TrackedSearch.is_active.is_(True))
+                .order_by(TrackedSearch.priority.desc())
+            )
+            active = self.session.execute(stmt).scalars().all()
+
+            due = []
+            for search in active:
+                if search.last_run_at is None:
+                    due.append(search)
+                else:
+                    interval = datetime.timedelta(
+                        hours=search.schedule_interval_hours,
+                    )
+                    if now >= search.last_run_at + interval:
+                        due.append(search)
+
+            logger.debug(
+                "searches_due_for_run_fetched",
+                count=len(due),
+            )
+            return due
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_searches_due_for_run_failed",
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get searches due for run: {exc}"
+            ) from exc
+
+    def update_search_last_run(self, search_id: int) -> None:
+        """Обновляет last_run_at для поискового запроса.
+
+        Args:
+            search_id: ID поискового запроса (TrackedSearch.id).
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            tracked = self.session.get(TrackedSearch, search_id)
+            if tracked is None:
+                logger.warning(
+                    "tracked_search_not_for_update_last_run",
+                    search_id=search_id,
+                )
+                return
+
+            tracked.last_run_at = datetime.datetime.utcnow()
+            self.session.flush()
+            logger.info(
+                "search_last_run_updated",
+                search_id=search_id,
+            )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "update_search_last_run_failed",
+                search_id=search_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to update search last run: {exc}"
+            ) from exc
+
+    def update_ad_analysis(
+        self,
+        ad_id: int,
+        z_score: float,
+        iqr_outlier: bool,
+        segment_key: str,
+    ) -> None:
+        """Обновляет аналитические поля объявления.
+
+        Args:
+            ad_id: Внутренний ID объявления (Ad.id).
+            z_score: Z-score цена относительно сегмента.
+            iqr_outlier: Является ли выбросом по IQR.
+            segment_key: Ключ сегмента.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            ad = self.session.get(Ad, ad_id)
+            if ad is None:
+                logger.warning(
+                    "ad_not_found_for_analysis_update",
+                    ad_id=ad_id,
+                )
+                return
+
+            ad.z_score = z_score
+            ad.iqr_outlier = iqr_outlier
+            ad.segment_key = segment_key
+            self.session.flush()
+            logger.info(
+                "ad_analysis_updated",
+                ad_id=ad_id,
+                z_score=z_score,
+                iqr_outlier=iqr_outlier,
+                segment_key=segment_key,
+            )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "update_ad_analysis_failed",
+                ad_id=ad_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to update ad analysis: {exc}"
             ) from exc
 
     # ------------------------------------------------------------------

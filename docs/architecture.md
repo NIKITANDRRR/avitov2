@@ -1,8 +1,8 @@
-# Архитектура PoC системы мониторинга Avito
+# Архитектура системы мониторинга Avito
 
-> **Версия:** 1.1
-> **Статус:** Draft
-> **Дата:** 2026-04-10
+> **Версия:** 2.0
+> **Статус:** Actual
+> **Дата:** 2026-04-12
 
 ---
 
@@ -15,26 +15,30 @@
 5. [Конфигурация](#5-конфигурация)
 6. [Алгоритм одного запуска](#6-алгоритм-одного-запуска)
 7. [Поток данных](#7-поток-данных)
-8. [Обработка ошибок](#8-обработка-ошибок)
-9. [Логирование](#9-логирование)
-10. [CLI — точка входа](#10-cli--точка-входа)
-11. [Зависимости](#11-зависимости)
-12. [Ограничения и допущения](#12-ограничения-и-допущения)
-13. [Ключевые паттерны](#13-ключевые-паттерны)
+8. [Аналитический движок v2](#8-аналитический-движок-v2)
+9. [Архитектура планировщика](#9-архитектура-планировщика)
+10. [Обработка ошибок](#10-обработка-ошибок)
+11. [Логирование](#11-логирование)
+12. [CLI — точка входа](#12-cli--точка-входа)
+13. [Скрипты утилиты](#13-скрипты-утилиты)
+14. [Зависимости](#14-зависимости)
+15. [Ограничения и допущения](#15-ограничения-и-допущения)
+16. [Ключевые паттерны](#16-ключевые-паттерны)
 
 ---
 
 ## 1. Обзор системы
 
-PoC/MVP система для мониторинга объявлений Avito с целью поиска товаров ниже рыночной цены. Система работает в **однопоточном режиме** с **больши́ми случайными задержками**, используя Playwright + Chromium для сбора данных.
+Система мониторинга объявлений Avito с расширенным анализом цен и циклическим планировщиком. Работает в **асинхронном режиме** с **больши́ми случайными задержками**, используя Playwright + Chromium для сбора данных.
 
 ### Принципы
 
-- **Low-traffic:** максимум 3 поисковых URL, 2–3 карточки на поиск, не более 6–9 объявлений за запуск
+- **Low-traffic:** случайные задержки между действиями, ограничение карточек на поиск
 - **Headful по умолчанию:** на этапе PoC используется видимый браузер
 - **Без API Avito:** только веб-скрапинг через Playwright
 - **Без прокси:** но архитектура готова к добавлению
-- **Одноразовый запуск:** нет фоновых процессов, один цикл — один запуск
+- **Циклический планировщик:** автоматический запуск каждые 5 минут с проверкой просроченных поисков
+- **Масштабирование:** батчевая обработка до 20+ поисков с `asyncio.Semaphore`
 
 ### Стек технологий
 
@@ -49,6 +53,7 @@ PoC/MVP система для мониторинга объявлений Avito 
 | Конфигурация    | pydantic-settings v2    |
 | CLI             | Typer                   |
 | Логирование     | structlog               |
+| Анализ цен      | numpy (IQR, Z-score, сегментация) |
 
 ---
 
@@ -61,49 +66,49 @@ avito/
 │   ├── main.py                     # Точка входа CLI
 │   ├── config/
 │   │   ├── __init__.py
-│   │   └── settings.py             # Pydantic Settings
+│   │   └── settings.py             # Pydantic Settings (все параметры)
 │   ├── collector/
 │   │   ├── __init__.py
-│   │   └── browser.py              # Playwright collector
+│   │   ├── browser.py              # Playwright collector
+│   │   └── collector.py            # Сборщик данных (извлечение seller_type)
 │   ├── parser/
 │   │   ├── __init__.py
 │   │   ├── search_parser.py        # Парсер поисковых страниц
-│   │   ├── ad_parser.py            # Парсер карточек объявлений
-│   │   └── selectors.py            # CSS-селекторы Avito с fallback
+│   │   └── ad_parser.py            # Парсер карточек объявлений
 │   ├── storage/
 │   │   ├── __init__.py
 │   │   ├── database.py             # Подключение к БД, session manager
-│   │   ├── models.py               # SQLAlchemy ORM-модели
-│   │   └── repository.py           # Repository pattern — CRUD операции
+│   │   ├── models.py               # SQLAlchemy ORM-модели (расширенные)
+│   │   └── repository.py           # Repository pattern — CRUD + аналитические запросы
 │   ├── analysis/
 │   │   ├── __init__.py
-│   │   └── price_analyzer.py       # Ценовой анализ
+│   │   └── analyzer.py             # Продвинутый анализ v2 (сегментация, IQR, Z-score)
 │   ├── notifier/
 │   │   ├── __init__.py
 │   │   ├── telegram_notifier.py    # Telegram уведомления
 │   │   └── email_notifier.py       # Email уведомления (fallback)
 │   ├── scheduler/
 │   │   ├── __init__.py
-│   │   └── cycle.py                # Оркестрация одного цикла
+│   │   ├── cli.py                  # CLI команды (run, run-once, init-db, test-telegram)
+│   │   ├── pipeline.py             # Пайплайн обработки поисков (батчевая обработка)
+│   │   └── scheduler.py            # Циклический планировщик (5-минутный цикл)
 │   └── utils/
 │       ├── __init__.py
-│       ├── html_storage.py         # Сохранение/чтение HTML файлов
-│       └── delays.py               # Случайные задержки
+│       ├── exceptions.py           # Кастомные исключения
+│       └── helpers.py              # Утилиты (задержки, URL, HTML, build_avito_url)
 ├── data/
 │   └── raw_html/
 │       ├── search/                 # HTML поисковых страниц
 │       └── ad/                     # HTML карточек объявлений
 ├── scripts/
-│   └── init_db.py                  # Инициализация БД — создание таблиц
+│   ├── init_db.py                  # Инициализация БД + миграции
+│   ├── seed_searches.py            # Заполнение поисковых запросов
+│   └── cleanup_duplicates.py       # Очистка дубликатов
 ├── tests/
-│   ├── __init__.py
-│   ├── test_parser.py
-│   ├── test_price_analyzer.py
-│   ├── test_repository.py
-│   └── fixtures/
-│       └── *.html                  # Тестовые HTML-файлы
+│   └── __init__.py
 ├── docs/
-│   └── architecture.md             # Этот файл
+│   ├── architecture.md             # Этот файл
+│   └── improvements_plan.md        # План улучшений
 ├── .env.example                    # Пример файла конфигурации
 ├── requirements.txt                # Зависимости Python
 ├── README.md                       # Инструкция по запуску
@@ -117,13 +122,13 @@ avito/
 | `app/config/`      | Конфигурация приложения через pydantic-settings           |
 | `app/collector/`   | Управление браузером Playwright, сбор HTML                |
 | `app/parser/`      | Извлечение структурированных данных из HTML               |
-| `app/storage/`     | Модели БД, подключение, CRUD-операции                    |
-| `app/analysis/`    | Расчёт рыночных цен, определение заниженных               |
+| `app/storage/`     | Модели БД, подключение, CRUD-операции, аналитические запросы |
+| `app/analysis/`    | Продвинутый анализ цен v2: сегментация, IQR, Z-score, составной score |
 | `app/notifier/`    | Отправка уведомлений в Telegram и Email (fallback)        |
-| `app/scheduler/`   | Оркестрация полного цикла сбора и анализа                 |
-| `app/utils/`       | Общие утилиты — HTML-хранилище, задержки                 |
+| `app/scheduler/`   | Оркестрация пайплайна, циклический планировщик, CLI       |
+| `app/utils/`       | Общие утилиты — задержки, нормализация, HTML, URL         |
 | `data/raw_html/`   | Сырые HTML-файлы, организованные по типу страницы         |
-| `scripts/`         | Скрипты администрирования                                 |
+| `scripts/`         | Скрипты администрирования (миграции, заполнение, очистка) |
 | `tests/`           | Модульные и интеграционные тесты                          |
 
 ---
@@ -144,6 +149,10 @@ erDiagram
         varchar search_url UK
         varchar search_phrase
         boolean is_active
+        integer schedule_interval_hours
+        timestamptz last_run_at
+        integer priority
+        integer max_ads_to_parse
         timestamptz created_at
         timestamptz updated_at
     }
@@ -170,6 +179,7 @@ erDiagram
         integer price
         varchar location
         varchar seller_name
+        varchar seller_type
         varchar condition
         timestamptz publication_date
         varchar search_url
@@ -180,6 +190,9 @@ erDiagram
         text last_error
         boolean is_undervalued
         float undervalue_score
+        float z_score
+        boolean iqr_outlier
+        varchar segment_key
     }
 
     ad_snapshots {
@@ -205,15 +218,20 @@ erDiagram
 
 ```sql
 CREATE TABLE tracked_searches (
-    id              BIGSERIAL       PRIMARY KEY,
-    search_url      VARCHAR(1024)   NOT NULL UNIQUE,
-    search_phrase   VARCHAR(512)    NOT NULL,          -- Описание/название запроса
-    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    id                      BIGSERIAL       PRIMARY KEY,
+    search_url              VARCHAR(1024)   NOT NULL UNIQUE,
+    search_phrase           VARCHAR(512)    NOT NULL,
+    is_active               BOOLEAN         NOT NULL DEFAULT TRUE,
+    schedule_interval_hours INTEGER         NOT NULL DEFAULT 2,       -- Интервал запуска (часы)
+    last_run_at             TIMESTAMPTZ,                               -- Время последнего запуска
+    priority                INTEGER         NOT NULL DEFAULT 5,       -- Приоритет (1-10, ниже = важнее)
+    max_ads_to_parse        INTEGER         NOT NULL DEFAULT 3,       -- Карточек за запуск
+    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_tracked_searches_is_active ON tracked_searches (is_active);
+CREATE INDEX idx_tracked_searches_last_run_at ON tracked_searches (last_run_at);
 ```
 
 #### `search_runs` — Запуски сбора
@@ -224,11 +242,11 @@ CREATE TABLE search_runs (
     tracked_search_id   BIGINT          NOT NULL REFERENCES tracked_searches(id) ON DELETE CASCADE,
     started_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     completed_at        TIMESTAMPTZ,
-    pages_fetched       INTEGER         NOT NULL DEFAULT 0,    -- Сколько страниц пагинации загружено
-    ads_found           INTEGER         NOT NULL DEFAULT 0,    -- Всего найдено в выдаче
-    ads_new             INTEGER         NOT NULL DEFAULT 0,    -- Новых, ранее не известных
-    ads_opened          INTEGER         NOT NULL DEFAULT 0,    -- Сколько карточек открыто
-    errors_count        INTEGER         NOT NULL DEFAULT 0,    -- Количество ошибок при обработке
+    pages_fetched       INTEGER         NOT NULL DEFAULT 0,
+    ads_found           INTEGER         NOT NULL DEFAULT 0,
+    ads_new             INTEGER         NOT NULL DEFAULT 0,
+    ads_opened          INTEGER         NOT NULL DEFAULT 0,
+    errors_count        INTEGER         NOT NULL DEFAULT 0,
     status              VARCHAR(32)     NOT NULL DEFAULT 'running',  -- running | completed | failed
     error_message       TEXT
 );
@@ -242,22 +260,26 @@ CREATE INDEX idx_search_runs_status ON search_runs (status);
 ```sql
 CREATE TABLE ads (
     id                  BIGSERIAL       PRIMARY KEY,
-    ad_id               BIGINT          NOT NULL UNIQUE,       -- Уникальный ID объявления Avito
+    ad_id               BIGINT          NOT NULL UNIQUE,
     url                 VARCHAR(1024)   NOT NULL,
     title               VARCHAR(512),
-    price               INTEGER,                                -- Цена в рублях (INTEGER, нормализованная)
+    price               INTEGER,
     location            VARCHAR(256),
     seller_name         VARCHAR(256),
-    condition           VARCHAR(64),                            -- new | used | и т.д.
+    seller_type         VARCHAR(32),                               -- Тип продавца: «частное», «магазин», «компания»
+    condition           VARCHAR(64),
     publication_date    TIMESTAMPTZ,
-    search_url          VARCHAR(1024)   NOT NULL,               -- URL поиска, откуда найдено
+    search_url          VARCHAR(1024)   NOT NULL,
     tracked_search_id   BIGINT          NOT NULL REFERENCES tracked_searches(id) ON DELETE CASCADE,
     first_seen_at       TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     last_scraped_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    parse_status        VARCHAR(32)     NOT NULL DEFAULT 'pending',  -- pending | parsed | failed | skipped
-    last_error          TEXT,                                    -- Последняя ошибка парсинга/сбора
+    parse_status        VARCHAR(32)     NOT NULL DEFAULT 'pending',
+    last_error          TEXT,
     is_undervalued      BOOLEAN         NOT NULL DEFAULT FALSE,
-    undervalue_score    FLOAT                                   -- Отклонение от медианы: price / median_price
+    undervalue_score    FLOAT,
+    z_score             FLOAT,                                     -- Z-score цены относительно сегмента
+    iqr_outlier         BOOLEAN         NOT NULL DEFAULT FALSE,      -- Является ли цена IQR-выбросом
+    segment_key         VARCHAR(256)                                -- Ключ сегмента анализа
 );
 
 CREATE INDEX idx_ads_ad_id ON ads (ad_id);
@@ -266,6 +288,7 @@ CREATE INDEX idx_ads_is_undervalued ON ads (is_undervalued);
 CREATE INDEX idx_ads_first_seen_at ON ads (first_seen_at);
 CREATE INDEX idx_ads_tracked_search_id ON ads (tracked_search_id);
 CREATE INDEX idx_ads_parse_status ON ads (parse_status);
+CREATE INDEX idx_ads_segment_key ON ads (segment_key);
 ```
 
 #### `ad_snapshots` — Снимки цен
@@ -276,7 +299,7 @@ CREATE TABLE ad_snapshots (
     ad_id       BIGINT          NOT NULL REFERENCES ads(id) ON DELETE CASCADE,
     price       INTEGER         NOT NULL,
     scraped_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    html_path   VARCHAR(512)    NOT NULL               -- Путь к файлу на диске
+    html_path   VARCHAR(512)    NOT NULL
 );
 
 CREATE INDEX idx_ad_snapshots_ad_id ON ad_snapshots (ad_id);
@@ -291,7 +314,7 @@ CREATE TABLE notifications_sent (
     ad_id                   BIGINT          NOT NULL REFERENCES ads(id) ON DELETE CASCADE,
     notification_type       VARCHAR(64)     NOT NULL DEFAULT 'undervalued',
     sent_at                 TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    telegram_message_id     BIGINT                                  -- ID сообщения в Telegram
+    telegram_message_id     BIGINT
 );
 
 CREATE INDEX idx_notifications_sent_ad_id ON notifications_sent (ad_id);
@@ -308,7 +331,7 @@ CREATE UNIQUE INDEX idx_notifications_sent_unique ON notifications_sent (ad_id, 
 
 ### 4.1 Data Classes / DTO
 
-Определяются в соответствующих модулях или в `app/models.py` при необходимости.
+Определяются в [`app/analysis/analyzer.py`](app/analysis/analyzer.py) и соответствующих модулях.
 
 ```python
 from dataclasses import dataclass, field
@@ -332,18 +355,26 @@ class AdData:
     price: int | None = None
     location: str | None = None
     seller_name: str | None = None
+    seller_type: str | None = None       # Тип продавца
     condition: str | None = None
     publication_date: datetime | None = None
     search_url: str | None = None
 
 @dataclass
 class MarketStats:
-    """Статистика рынка для поискового запроса."""
+    """Расширенная статистика рынка для поискового запроса/сегмента."""
     search_url: str
     median_price: float
     mean_price: float
-    q1_price: float                    # Первый квартиль
-    sample_size: int                   -- Размер выборки
+    q1_price: float                       # Первый квартиль
+    q3_price: float | None = None         # Третий квартиль (75-й перцентиль)
+    iqr: float | None = None              # Межквартильный размах: Q3 - Q1
+    std_dev: float | None = None          # Стандартное отклонение
+    lower_fence: float | None = None      # Нижняя граница IQR: Q1 - 1.5 * IQR
+    upper_fence: float | None = None      # Верхняя граница IQR: Q3 + 1.5 * IQR
+    trimmed_mean: float | None = None     # Среднее после удаления 5% выбросов
+    segment_key: str = ""                 # Ключ сегмента
+    sample_size: int = 0                  # Размер выборки
     calculated_at: datetime = field(default_factory=datetime.now)
 
 @dataclass
@@ -351,11 +382,36 @@ class UndervaluedAd:
     """Объявление ниже рыночной цены."""
     ad: AdData
     stats: MarketStats
-    undervalue_score: float            # price / median_price
-    price_diff_percent: float          # Отклонение в %
+    undervalue_score: float               # price / median_price
+    price_diff_percent: float             # Отклонение в %
+
+@dataclass
+class UndervaluedResult:
+    """Результат анализа недооценённости v2."""
+    ad_id: int
+    is_undervalued: bool
+    undervalue_score: float
+    iqr_score: float
+    zscore_score: float
+    median_score: float
+    segment_key: str
+
+@dataclass
+class AdAnalysisResult:
+    """Полный результат анализа одного объявления."""
+    ad_id: int
+    price: int
+    segment_key: str
+    market_stats: MarketStats
+    z_score: float | None
+    iqr_outlier: bool
+    is_undervalued: bool
+    undervalue_score: float
 ```
 
-### 4.2 Collector — `app/collector/browser.py`
+### 4.2 Collector — `app/collector/`
+
+#### `app/collector/browser.py`
 
 ```python
 from playwright.async_api import async_playwright, Browser, Page
@@ -363,7 +419,7 @@ from playwright.async_api import async_playwright, Browser, Page
 class AvitoCollector:
     """Сборщик HTML-страниц Avito через Playwright."""
 
-    def __init__(self, settings: "AppSettings") -> None:
+    def __init__(self, settings: "Settings") -> None:
         """
         Инициализация коллектора с настройками.
 
@@ -408,14 +464,6 @@ class AvitoCollector:
         """
         Открыть карточку объявления и вернуть HTML.
 
-        Алгоритм:
-        1. Случайная задержка перед открытием
-        2. Создание нового контекста со случайным User-Agent
-        3. Навигация по URL
-        4. Ожидание загрузки основных данных (price, title)
-        5. Получение HTML через page.content()
-        6. Закрытие контекста
-
         Args:
             url: URL карточки объявления
 
@@ -428,77 +476,23 @@ class AvitoCollector:
         ...
 ```
 
-**Примечание по User-Agent:** Используется список популярных десктопных User-Agent. При каждом вызове выбирается случайный.
-
-**Примечание по прокси:** В `AvitoCollector.__init__` проверяется `settings.USE_PROXY`. Если `True`, браузерный контекст создаётся с параметром `proxy={"server": settings.PROXY_URL}`. По умолчанию `False`.
-
-### 4.3 Parser — `app/parser/`
-
-#### `app/parser/selectors.py`
+#### `app/collector/collector.py`
 
 ```python
-"""
-CSS-селекторы для парсинга страниц Avito.
+class Collector:
+    """Высокоуровневый сборщик данных Avito."""
 
-Каждый селектор определяется как список fallback-вариантов.
-Парсер пробует селекторы по порядку и берёт результат первого совпадения.
-"""
-
-SEARCH_RESULT_ITEMS: list[str] = [
-    "[data-marker='item']",
-    "div[itemtype='http://schema.org/Product']",
-    "div.iva-item-root--",
-]
-
-SEARCH_RESULT_TITLE: list[str] = [
-    "[itemprop='name']",
-    "a.iva-item-root--",
-]
-
-SEARCH_RESULT_PRICE: list[str] = [
-    "[itemprop='price']",
-    "span.price-text-",
-]
-
-SEARCH_RESULT_URL: list[str] = [
-    "a[itemprop='url']",
-    "a.iva-item-root--",
-]
-
-SEARCH_RESULT_LOCATION: list[str] = [
-    "[class*='geo']",
-]
-
-AD_TITLE: list[str] = [
-    "h1.title-root-",
-    "h1[data-marker='item-view/title-info']",
-]
-
-AD_PRICE: list[str] = [
-    "span.js-item-price",
-    "[itemprop='price']",
-    "span.price-text-",
-]
-
-AD_LOCATION: list[str] = [
-    "[class*='style-item-address__content']",
-    "[data-marker='item-view/item-address']",
-]
-
-AD_SELLER_NAME: list[str] = [
-    "[data-marker='seller-info/name']",
-    "[class*='style-seller-info-name']",
-]
-
-AD_CONDITION: list[str] = [
-    "[class*='params-paramsList'] li",
-]
-
-AD_PUBLICATION_DATE: list[str] = [
-    "[data-marker='item-view/item-date']",
-    "[class*='style-item-header-date']",
-]
+    async def collect_ad_data(self, html: str, url: str) -> AdData:
+        """
+        Собрать данные объявления из HTML карточки.
+        Извлекает все поля включая seller_type.
+        """
+        ...
 ```
+
+**Примечание:** [`collector.py`](app/collector/collector.py) извлекает `seller_type` при парсинге карточки объявления.
+
+### 4.3 Parser — `app/parser/`
 
 #### `app/parser/search_parser.py`
 
@@ -532,12 +526,6 @@ def extract_ad_id_from_url(url: str) -> int | None:
 
     Пример: https://www.avito.ru/moskva/telefony/iphone_1234567890
     Результат: 1234567890
-
-    Args:
-        url: URL объявления
-
-    Returns:
-        Числовой ID или None если не удалось извлечь
     """
     ...
 ```
@@ -545,61 +533,21 @@ def extract_ad_id_from_url(url: str) -> int | None:
 #### `app/parser/ad_parser.py`
 
 ```python
-from bs4 import BeautifulSoup
-import re
-
 def normalize_price(price_text: str | None) -> int | None:
     """
     Нормализация цены из текста Avito в целое число.
 
-    Алгоритм:
-    1. Если price_text is None — вернуть None
-    2. Удалить символы: пробелы, неразрывные пробелы (\xa0), символ ₽, запятые
-    3. Извлечь числовую часть через regex: r'[\d]+'
-    4. Объединить все найденные группы цифр в одно число
-    5. Привести к int
-
     Примеры:
         "12 345 ₽" → 12345
         "1\xa0234" → 1234
-        "Цена: 50 000 руб." → 50000
         None → None
-        "" → None
-
-    Args:
-        price_text: сырой текст цены из HTML
-
-    Returns:
-        Цена как int или None
     """
-    if not price_text:
-        return None
-    cleaned = price_text.replace("\xa0", "").replace(" ", "").replace(",", "")
-    digits = re.findall(r"\d+", cleaned)
-    if not digits:
-        return None
-    return int("".join(digits))
+    ...
 
 def parse_ad_page(html: str, url: str) -> AdData:
     """
     Парсинг HTML карточки объявления Avito.
-
-    Алгоритм:
-    1. Создать BeautifulSoup(html, 'lxml')
-    2. Извлечь поля по fallback-селекторам из selectors.py
-    3. Цена: извлечь текст, пропустить через normalize_price()
-    4. Дата публикации: распарсить относительную дату — "сегодня", "вчера" и т.д.
-    5. Заполнить AdData, отсутствующие поля = None
-
-    Args:
-        html: HTML-код карточки объявления
-        url: URL объявления
-
-    Returns:
-        AdData с извлечёнными полями. Поля могут быть None.
-
-    Raises:
-        ParserError: если не удалось извлечь критичные поля (ad_id)
+    Извлекает все поля включая seller_type.
     """
     ...
 ```
@@ -612,32 +560,15 @@ def parse_ad_page(html: str, url: str) -> AdData:
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 def create_engine(database_url: str):
-    """
-    Создать async SQLAlchemy engine.
-
-    Args:
-        database_url: PostgreSQL DSN, например:
-            postgresql+asyncpg://user:pass@localhost:5432/avito_monitor
-
-    Returns:
-        AsyncEngine
-    """
+    """Создать async SQLAlchemy engine."""
     ...
 
 def create_session_factory(engine) -> async_sessionmaker[AsyncSession]:
-    """
-    Создать фабрику async-сессий.
-
-    Returns:
-        async_sessionmaker[AsyncSession]
-    """
+    """Создать фабрику async-сессий."""
     ...
 
 async def init_db(engine) -> None:
-    """
-    Создать все таблицы по моделям SQLAlchemy.
-    Используется в scripts/init_db.py.
-    """
+    """Создать все таблицы по моделям SQLAlchemy."""
     ...
 ```
 
@@ -646,9 +577,9 @@ async def init_db(engine) -> None:
 SQLAlchemy 2.0 ORM-модели, соответствующие таблицам из раздела 3. Используют `Mapped[type]` и `mapped_column`. Модельный класс `Base` с `DeclarativeBase`.
 
 Модели:
-- `TrackedSearch` → `tracked_searches`
+- `TrackedSearch` → `tracked_searches` (включая `schedule_interval_hours`, `last_run_at`, `priority`, `max_ads_to_parse`)
 - `SearchRun` → `search_runs`
-- `Ad` → `ads`
+- `Ad` → `ads` (включая `seller_type`, `z_score`, `iqr_outlier`, `segment_key`)
 - `AdSnapshot` → `ad_snapshots`
 - `NotificationSent` → `notifications_sent`
 
@@ -676,6 +607,22 @@ class Repository:
         """Получить или создать запись отслеживаемого поиска."""
         ...
 
+    async def get_searches_due_for_run(self) -> list[TrackedSearch]:
+        """
+        Получить поиски, готовые к запуску.
+
+        Выбирает активные поиски, у которых:
+        - last_run_at IS NULL (никогда не запускался), ИЛИ
+        - last_run_at + schedule_interval_hours <= NOW()
+
+        Сортировка по priority (ASC), затем по last_run_at (ASC).
+        """
+        ...
+
+    async def update_search_last_run(self, search_id: int) -> None:
+        """Обновить last_run_at = NOW() для указанного поиска."""
+        ...
+
     # --- SearchRun ---
 
     async def create_search_run(
@@ -693,17 +640,7 @@ class Repository:
         ads_opened: int = 0,
         errors_count: int = 0,
     ) -> None:
-        """
-        Завершить запуск — установить completed_at, метрики, status='completed'.
-
-        Args:
-            run_id: ID запуска
-            ads_found: всего найдено в выдаче
-            ads_new: новых, ранее не известных
-            pages_fetched: сколько страниц пагинации загружено
-            ads_opened: сколько карточек открыто
-            errors_count: количество ошибок при обработке
-        """
+        """Завершить запуск — установить completed_at, метрики, status='completed'."""
         ...
 
     async def fail_search_run(
@@ -723,6 +660,7 @@ class Repository:
     ) -> tuple[Ad, bool]:
         """
         Получить или создать объявление.
+        Обрабатывает IntegrityError при конкурентной вставке.
 
         Returns:
             Кортеж (модель Ad, флаг created_new)
@@ -732,23 +670,12 @@ class Repository:
     async def update_ad_data(self, ad_id: int, data: AdData) -> None:
         """
         Обновить данные объявления из AdData.
-
-        Также устанавливает:
-        - parse_status = 'parsed' при успехе
-        - last_scraped_at = NOW()
-        - last_error = None
+        Устанавливает parse_status = 'parsed', last_scraped_at = NOW().
         """
         ...
 
     async def mark_ad_parse_failed(self, ad_id: int, error: str) -> None:
-        """
-        Отметить объявление как failed при парсинге.
-
-        Устанавливает:
-        - parse_status = 'failed'
-        - last_error = error
-        - last_scraped_at = NOW()
-        """
+        """Отметить объявление как failed при парсинге."""
         ...
 
     async def mark_ad_undervalued(
@@ -763,8 +690,6 @@ class Repository:
         """
         Получить множество ad_id объявлений, которые уже проверялись
         за последние N часов для данного search_url.
-
-        Используется для дедупликации — не открывать повторно.
         """
         ...
 
@@ -772,6 +697,50 @@ class Repository:
         self, search_url: str
     ) -> list[Ad]:
         """Получить все объявления для данного поискового запроса."""
+        ...
+
+    async def get_ads_by_segment(
+        self, segment_key: str
+    ) -> list[Ad]:
+        """
+        Получить все объявления в указанном сегменте.
+
+        Args:
+            segment_key: Ключ сегмента (например, "Новое_Москва_частное")
+        """
+        ...
+
+    async def get_ads_for_analysis(
+        self, tracked_search_id: int, max_age_days: int = 14
+    ) -> list[Ad]:
+        """
+        Получить объявления для ценового анализа.
+
+        Фильтрует по:
+        - tracked_search_id
+        - price IS NOT NULL
+        - publication_date или first_seen_at не старше max_age_days
+
+        Args:
+            tracked_search_id: ID отслеживаемого поиска
+            max_age_days: Максимальный возраст объявлений в днях
+        """
+        ...
+
+    async def update_ad_analysis(
+        self,
+        ad_id: int,
+        z_score: float | None = None,
+        iqr_outlier: bool | None = None,
+        segment_key: str | None = None,
+        is_undervalued: bool | None = None,
+        undervalue_score: float | None = None,
+    ) -> None:
+        """
+        Обновить результаты анализа для объявления.
+
+        Записывает: z_score, iqr_outlier, segment_key, is_undervalued, undervalue_score.
+        """
         ...
 
     # --- AdSnapshots ---
@@ -797,37 +766,29 @@ class Repository:
         ...
 ```
 
-### 4.5 Analysis — `app/analysis/price_analyzer.py`
+### 4.5 Analysis — `app/analysis/analyzer.py`
 
 ```python
-import statistics
+import numpy as np
 
 class PriceAnalyzer:
-    """Анализатор рыночных цен."""
+    """Продвинутый анализатор рыночных цен v2."""
 
-    def __init__(self, repository: Repository, threshold: float = 0.8) -> None:
+    def __init__(self, repository: Repository, settings: "Settings") -> None:
         """
         Args:
             repository: репозиторий для доступа к данным
-            threshold: порог определения undervalued (price < median * threshold)
+            settings: конфигурация приложения (параметры анализа)
         """
         ...
+
+    # === Базовые методы v1 ===
 
     async def calculate_market_stats(
         self, search_url: str
     ) -> MarketStats | None:
         """
-        Рассчитать статистику рынка для поискового запроса.
-
-        Алгоритм:
-        1. Получить все ads для search_url через repository
-        2. Отфильтровать объявления с price is not None
-        3. Если sample_size < 3 — вернуть None (недостаточно данных)
-        4. Рассчитать: median_price, mean_price, q1_price
-        5. Вернуть MarketStats
-
-        Args:
-            search_url: URL поискового запроса
+        Рассчитать базовую статистику рынка для поискового запроса.
 
         Returns:
             MarketStats или None если недостаточно данных
@@ -838,23 +799,100 @@ class PriceAnalyzer:
         self, search_url: str
     ) -> list[UndervaluedAd]:
         """
-        Найти объявления ниже рыночной цены.
+        Найти объявления ниже рыночной цены (алгоритм v1).
 
-        Алгоритм:
-        1. Рассчитать MarketStats для search_url
-        2. Если stats is None — вернуть пустой список
-        3. Получить все ads для search_url
-        4. Для каждого ad:
-           - score = ad.price / stats.median_price
-           - если score < threshold — это undervalued
-           - price_diff_percent = (1 - score) * 100
-        5. Вернуть список UndervaluedAd
+        Критерий: price < median * threshold
+        """
+        ...
 
-        Args:
-            search_url: URL поискового запроса
+    # === Методы v2: сегментация и фильтрация ===
+
+    def segment_ads(self, ads: list[Ad]) -> dict[str, list[Ad]]:
+        """
+        Сегментация объявлений по ключу {condition}_{location}_{seller_type}.
+
+        Правила:
+        - condition: значение из Ad.condition — «Новое», «Б/у», «Не указано»
+        - location: город из Ad.location (первый компонент: «Москва» из «Москва, Арбат»)
+        - seller_type: тип продавца из Ad.seller_type
 
         Returns:
-            Список UndervaluedAd, отсортированный по score (самые дешёвые первыми)
+            Словарь {segment_key: [list of Ad]}
+        """
+        ...
+
+    def build_segment_key(self, ad: Ad) -> str:
+        """
+        Построить ключ сегмента для объявления.
+
+        Returns:
+            Строка вида "Новое_Москва_частное"
+        """
+        ...
+
+    def filter_iqr(
+        self, prices: np.ndarray, k: float = 1.5
+    ) -> np.ndarray:
+        """
+        IQR-фильтрация выбросов.
+
+        Алгоритм:
+        1. Q1 = percentile(prices, 25)
+        2. Q3 = percentile(prices, 75)
+        3. IQR = Q3 - Q1
+        4. lower = Q1 - k * IQR
+        5. upper = Q3 + k * IQR
+        6. Оставить prices[(prices >= lower) & (prices <= upper)]
+
+        Args:
+            prices: массив цен
+            k: множитель IQR (по умолчанию 1.5)
+        """
+        ...
+
+    def calculate_zscore(self, prices: np.ndarray) -> np.ndarray:
+        """
+        Расчёт Z-score для массива цен.
+
+        Формула: z = (price - mean) / std
+        """
+        ...
+
+    # === Методы v2: расширенный анализ ===
+
+    async def detect_undervalued_v2(
+        self, ads: list[Ad], market_stats: MarketStats
+    ) -> list[UndervaluedResult]:
+        """
+        Определение недооценённых объявлений (алгоритм v2).
+
+        Составной критерий:
+        - IQR-аномалия: price < Q1 - k * IQR
+        - Z-score: z < -z_threshold
+        - Процент от медианы: price < median * threshold
+
+        Комбинированный score:
+        score = 0.4 * iqr_score + 0.3 * zscore_score + 0.3 * median_score
+
+        Returns:
+            Список UndervaluedResult для каждого объявления
+        """
+        ...
+
+    async def analyze_ad(
+        self, ad: Ad, market_stats: MarketStats
+    ) -> AdAnalysisResult:
+        """
+        Полный анализ одного объявления.
+
+        Включает:
+        - Расчёт Z-score
+        - Проверку IQR-выброса
+        - Определение недооценённости
+        - Расчёт составного score
+
+        Returns:
+            AdAnalysisResult со всеми метриками
         """
         ...
 ```
@@ -864,231 +902,206 @@ class PriceAnalyzer:
 #### `app/notifier/telegram_notifier.py`
 
 ```python
-import httpx
-
 class TelegramNotifier:
     """Отправка уведомлений в Telegram."""
 
-    def __init__(self, bot_token: str, chat_id: str) -> None:
-        """
-        Args:
-            bot_token: токен Telegram бота
-            chat_id: ID чата/канала для отправки
-        """
-        ...
+    def __init__(self, bot_token: str, chat_id: str) -> None: ...
 
     async def send_undervalued_notification(
         self, ad: AdData, stats: MarketStats, undervalue_score: float
     ) -> int | None:
         """
         Отправить уведомление о заниженном объявлении.
-
-        Формат сообщения:
-        ```
-        🔔 Товар ниже рынка!
-
-        📦 {title}
-        💰 Цена: {price:,} ₽
-        📊 Медиана: {median_price:,.0f} ₽
-        📉 Отклонение: {diff_percent:.1f}%
-        📍 {location}
-        🔗 {url}
-        🕐 Обнаружено: {first_seen_at}
-        ```
-
-        Args:
-            ad: данные объявления
-            stats: статистика рынка
-            undervalue_score: отношение цены к медиане
-
-        Returns:
-            telegram_message_id при успехе, None при ошибке
+        Возвращает telegram_message_id при успехе, None при ошибке.
         """
         ...
 
     async def send_cycle_summary(
         self, total_ads: int, new_ads: int, undervalued_count: int
     ) -> None:
-        """
-        Отправить краткое резюме цикла сбора.
-
-        Формат:
-        ```
-        ✅ Цикл завершён
-        Обработано поисков: {search_count}
-        Найдено объявлений: {total_ads}
-        Новых: {new_ads}
-        Ниже рынка: {undervalued_count}
-        ```
-        """
+        """Отправить краткое резюме цикла сбора."""
         ...
 ```
-
-**Реализация:** Используется `httpx.AsyncClient` для прямых HTTP-запросов к Telegram Bot API. Это проще и легче, чем `python-telegram-bot`, для простых уведомлений.
 
 #### `app/notifier/email_notifier.py`
 
 ```python
-import aiosmtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
 class EmailNotifier:
     """Резервный email-нотификатор (fallback при недоступности Telegram)."""
 
-    def __init__(
-        self,
-        smtp_host: str,
-        smtp_port: int,
-        smtp_user: str,
-        smtp_password: str,
-        email_from: str,
-        email_to: list[str],
-        use_tls: bool = True,
-    ) -> None:
-        """
-        Args:
-            smtp_host: SMTP сервер (например, smtp.gmail.com)
-            smtp_port: Порт SMTP (обычно 587 для TLS)
-            smtp_user: Логин SMTP
-            smtp_password: Пароль SMTP (для Gmail — пароль приложения)
-            email_from: Email отправителя
-            email_to: Список email получателей
-            use_tls: Использовать TLS (по умолчанию True)
-        """
-        ...
-
     async def send_notification(self, subject: str, body: str) -> bool:
-        """
-        Отправить email-уведомление.
-
-        Args:
-            subject: Тема письма
-            body: Тело письма (HTML)
-
-        Returns:
-            True при успехе, False при ошибке
-        """
+        """Отправить email-уведомление. Возвращает True при успехе."""
         ...
 
     async def send_undervalued_notifications(
         self, undervalued_ads: list[UndervaluedAd]
     ) -> int:
-        """
-        Отправить уведомления о всех недооценённых товарах по email.
-
-        Args:
-            undervalued_ads: список недооценённых объявлений
-
-        Returns:
-            Количество успешно отправленных уведомлений
-        """
+        """Отправить уведомления о всех недооценённых товарах по email."""
         ...
 ```
 
-**Реализация:** Используется `aiosmtplib` для асинхронной отправки email через SMTP. Является fallback-каналом: вызывается только если Telegram недоступен или вернул ошибку.
+### 4.7 Scheduler — `app/scheduler/`
 
-### 4.7 Scheduler — `app/scheduler/cycle.py`
+#### `app/scheduler/scheduler.py`
 
 ```python
-class CycleOrchestrator:
-    """Оркестратор одного цикла сбора и анализа."""
+class Scheduler:
+    """Циклический планировщик запуска поисков.
 
-    def __init__(
-        self,
-        settings: "AppSettings",
-        collector: AvitoCollector,
-        repository: Repository,
-        price_analyzer: PriceAnalyzer,
-        notifier: TelegramNotifier,
-        email_notifier: EmailNotifier,
-        html_storage: HtmlStorage,
+    Периодически проверяет, какие поиски пора запускать,
+    и передаёт их в Pipeline для обработки.
+    """
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        """
+        Args:
+            settings: Конфигурация приложения.
+                Если None — создаётся экземпляр по умолчанию.
+        """
+        ...
+
+    async def run(self) -> None:
+        """
+        Основной цикл: проверяет каждые 5 минут, какие поиски пора запустить.
+
+        Цикл работает до вызова stop(). Каждый цикл:
+            1. Вызывает Pipeline.run_search_cycle() для обработки
+               всех просроченных поисков.
+            2. Спит 5 минут до следующей проверки.
+
+        Исключения в одном цикле не прерывают работу планировщика.
+        """
+        ...
+
+    def stop(self) -> None:
+        """Остановить планировщик. Текущий цикл завершится корректно."""
+        ...
+```
+
+#### `app/scheduler/pipeline.py`
+
+```python
+class Pipeline:
+    """Пайплайн обработки поисковых запросов с батчевой обработкой."""
+
+    def __init__(self, settings: Settings) -> None: ...
+
+    async def run_search_cycle(self) -> dict:
+        """
+        Основной цикл обработки поисков из БД.
+
+        Алгоритм:
+        1. Получить список поисков, готовых к запуску (get_searches_due_for_run)
+        2. Разбить на батчи по MAX_CONCURRENT_SEARCHES
+        3. Для каждого батча:
+           - Запустить обработки параллельно через asyncio.Semaphore
+           - Задержка SEARCH_DELAY_SECONDS между поисками
+           - Задержка BATCH_DELAY_SECONDS между батчами
+        4. Анализ и уведомления (_analyze_and_notify_searches)
+
+        Returns:
+            Словарь со статистикой: total_searches, total_ads, etc.
+        """
+        ...
+
+    async def _process_tracked_search(self, search: TrackedSearch) -> dict:
+        """
+        Обработка одного поискового запроса.
+
+        Включает: сбор поисковой страницы, парсинг, дедупликация,
+        сбор карточек, обновление last_run_at.
+        """
+        ...
+
+    async def _analyze_and_notify_searches(
+        self, searches: list[TrackedSearch]
     ) -> None:
-        ...
-
-    async def run_single_cycle(self) -> None:
         """
-        Выполнить один полный цикл сбора и анализа.
+        Анализ цен и отправка уведомлений для обработанных поисков.
 
-        См. раздел 6 — Алгоритм одного запуска.
-        """
-        ...
-```
-
-### 4.8 Utils
-
-#### `app/utils/html_storage.py`
-
-```python
-class HtmlStorage:
-    """Сохранение и чтение HTML-файлов на диске."""
-
-    def __init__(self, base_path: str = "data/raw_html") -> None:
-        """
-        Args:
-            base_path: корневая директория для HTML-файлов
+        Для каждого поиска:
+        1. Получить объявления для анализа (get_ads_for_analysis)
+        2. Сегментировать (segment_ads)
+        3. Рассчитать статистику по сегментам
+        4. Определить недооценённые (detect_undervalued_v2)
+        5. Обновить результаты анализа (update_ad_analysis)
+        6. Отправить уведомления (_send_notifications)
         """
         ...
 
-    def save_search_html(self, html: str, search_url: str) -> str:
+    async def _send_notifications(
+        self, undervalued_ads: list[UndervaluedResult]
+    ) -> None:
         """
-        Сохранить HTML поисковой страницы.
-
-        Имя файла: search/{search_url_hash}_{timestamp}.html
-
-        Args:
-            html: HTML-код страницы
-            search_url: URL для генерации хеша
-
-        Returns:
-            Относительный путь к сохранённому файлу
-        """
-        ...
-
-    def save_ad_html(self, html: str, ad_id: int) -> str:
-        """
-        Сохранить HTML карточки объявления.
-
-        Имя файла: ad/{ad_id}_{timestamp}.html
-
-        Args:
-            html: HTML-код карточки
-            ad_id: ID объявления
-
-        Returns:
-            Относительный путь к сохранённому файлу
+        Отправка уведомлений: Telegram → Email fallback.
         """
         ...
 ```
 
-#### `app/utils/delays.py`
+### 4.8 Utils — `app/utils/`
+
+#### `app/utils/helpers.py`
 
 ```python
-import asyncio
-import random
+async def random_delay(min_sec: float, max_sec: float) -> None:
+    """Асинхронная случайная задержка с логированием."""
+    ...
 
-async def random_delay(
-    min_seconds: float = 5.0,
-    max_seconds: float = 15.0
-) -> None:
-    """
-    Асинхронная случайная задержка.
+def normalize_url(url: str) -> str:
+    """Нормализация URL: удаление query-параметров, fragment, trailing slash."""
+    ...
 
-    Args:
-        min_seconds: минимальная задержка в секундах
-        max_seconds: максимальная задержка в секундах
-    """
-    delay = random.uniform(min_seconds, max_seconds)
-    await asyncio.sleep(delay)
+def extract_ad_id_from_url(url: str) -> str:
+    """Извлечение ID объявления из URL Avito."""
+    ...
 
-def get_random_user_agent() -> str:
+def save_html(html: str, directory: str, filename: str) -> str:
+    """Сохранение HTML-контента на диск. Возвращает полный путь к файлу."""
+    ...
+
+def normalize_price(price_str: str) -> float | None:
+    """Парсинг строки цены в число."""
+    ...
+
+def setup_logging(level: str) -> None:
+    """Настройка structlog для приложения."""
+    ...
+
+def build_avito_url(query: str, location: str = "Москва") -> str:
     """
-    Вернуть случайный User-Agent из списка популярных десктопных браузеров.
+    Построить URL поиска Avito по запросу и локации.
+
+    Поддерживаемые локации: Москва, Санкт-Петербург, Екатеринбург,
+    Новосибирск, Россия (и транслитерации).
 
     Returns:
-        Строка User-Agent
+        URL вида https://www.avito.ru/{location_slug}?q={query}&s=104
     """
     ...
+```
+
+#### `app/utils/exceptions.py`
+
+```python
+class AvitoMonitorError(Exception):
+    """Базовое исключение системы."""
+    pass
+
+class CollectorError(AvitoMonitorError):
+    """Ошибка при сборе HTML через Playwright."""
+    pass
+
+class ParserError(AvitoMonitorError):
+    """Ошибка при парсинге HTML."""
+    pass
+
+class StorageError(AvitoMonitorError):
+    """Ошибка при работе с БД."""
+    pass
+
+class NotificationError(AvitoMonitorError):
+    """Ошибка при отправке уведомления."""
+    pass
 ```
 
 ---
@@ -1100,7 +1113,7 @@ def get_random_user_agent() -> str:
 ```python
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-class AppSettings(BaseSettings):
+class Settings(BaseSettings):
     """
     Конфигурация приложения.
     Значения загружаются из .env файла и/или переменных окружения.
@@ -1127,7 +1140,7 @@ class AppSettings(BaseSettings):
     startup_delay_max: float = 30.0                  # Максимальная задержка перед стартом цикла
 
     # --- Браузер ---
-    headless: bool = False                           # Headless-режим (False = видимый браузер)
+    headless: bool = False                           # Headless-режим
     use_proxy: bool = False                          # Использовать прокси
     proxy_url: str | None = None                     # URL прокси-сервера
 
@@ -1135,347 +1148,418 @@ class AppSettings(BaseSettings):
     telegram_bot_token: str                          # Токен Telegram бота
     telegram_chat_id: str                            # ID чата для уведомлений
 
+    # --- Telegram MTProto ---
+    telegram_api_id: int = 0                         # API ID для MTProto
+    telegram_api_hash: str = ""                      # API Hash для MTProto
+    mtproxy_enabled: bool = True                     # Использовать MTProto proxy
+    mtproxy_address: str = "135.136.188.80"          # Адрес MTProxy сервера
+    mtproxy_port: int = 15871                        # Порт MTProxy
+    mtproxy_secret: str = ""                         # Секрет MTProxy
+
     # --- Email (fallback) ---
-    smtp_host: str | None = None                     # SMTP сервер (например, smtp.gmail.com)
-    smtp_port: int = 587                             # Порт SMTP
-    smtp_user: str | None = None                     # Логин SMTP
-    smtp_password: str | None = None                 # Пароль SMTP (для Gmail — пароль приложения)
-    smtp_use_tls: bool = True                        # Использовать TLS
-    email_from: str | None = None                    # Email отправителя
-    email_to: str | None = None                      # Email получателей (через запятую)
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_use_tls: bool = True
+    email_from: str | None = None
+    email_to: str | None = None
 
     # --- База данных ---
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/avito_monitor"
+    database_url: str = "postgresql+asyncpg://avito:avito@localhost:5432/avito_monitor"
 
-    # --- Анализ цен ---
+    # --- Анализ цен (v1) ---
     undervalue_threshold: float = 0.8                # Порог: price < median * threshold → undervalued
 
+    # --- Фильтрация аномалий (v2) ---
+    trim_percent: float = 0.05                       # % отбрасывания с каждого края
+    iqr_multiplier: float = 1.5                      # Множитель для IQR fences
+    temporal_window_days: int = 14                   # Окно анализа в днях
+    min_segment_size: int = 3                        # Минимальный размер сегмента
+    undervalued_threshold: float = 0.3               # Порог составного score для недооценённости
+    zscore_threshold: float = 1.5                    # Порог Z-score для аномалий
+    median_discount_threshold: float = 0.85          # Порог % от медианы
+
+    # --- Масштабирование поиска ---
+    max_concurrent_searches: int = 3                 # Макс. параллельных поисков в батче
+    default_schedule_interval_hours: int = 2         # Интервал запуска по умолчанию (часы)
+    default_max_ads_to_parse: int = 3                # Карточек на поиск за запуск по умолчанию
+    batch_delay_seconds: float = 30                  # Задержка между батчами поисков (сек)
+    search_delay_seconds: float = 5                  # Задержка между поисками в батче (сек)
+
     # --- Хранение ---
-    raw_html_path: str = "data/raw_html"             # Путь к директории с HTML-файлами
+    raw_html_path: str = "data/raw_html"
 
     # --- Логирование ---
-    log_level: str = "INFO"                          # Уровень логирования
+    log_level: str = "INFO"
 ```
 
-### `.env.example`
+### Назначение параметров фильтрации аномалий
 
-```env
-# Поисковые запросы (через запятую)
-SEARCH_URLS=https://www.avito.ru/rossiya/telefony?q=iphone+15,https://www.avito.ru/rossiya/noutbuki?q=macbook
-SEARCH_PHRASES=iPhone 15,MacBook
+| Параметр | Назначение |
+|---|---|
+| `TRIM_PERCENT` | Доля отбрасываемых выбросов с каждого края распределения (5% = 0.05) |
+| `IQR_MULTIPLIER` | Множитель k для расчёта IQR-границ: `[Q1 - k×IQR, Q3 + k×IQR]` |
+| `TEMPORAL_WINDOW_DAYS` | Временное окно: в анализе участвуют только объявления не старше N дней |
+| `MIN_SEGMENT_SIZE` | Минимальное количество объявлений в сегменте для статистической значимости |
+| `UNDERVALUED_THRESHOLD` | Порог составного undervalue_score: если score > threshold → недооценён |
+| `ZSCORE_THRESHOLD` | Порог Z-score: если z < -threshold → аномально дешёвый |
+| `MEDIAN_DISCOUNT_THRESHOLD` | Порог % от медианы: если price < median × threshold → недооценён |
 
-# Лимиты
-MAX_SEARCH_PAGES_PER_RUN=3
-MAX_ADS_PER_SEARCH_PER_RUN=3
+### Назначение параметров масштабирования
 
-# Задержки (секунды)
-MIN_DELAY_SECONDS=5.0
-MAX_DELAY_SECONDS=15.0
-STARTUP_DELAY_MIN=0
-STARTUP_DELAY_MAX=30
-
-# Браузер
-HEADLESS=false
-USE_PROXY=false
-PROXY_URL=
-
-# Telegram
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_chat_id_here
-
-# Email (fallback-уведомления)
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=your_email@gmail.com
-SMTP_PASSWORD=your_app_password
-SMTP_USE_TLS=true
-EMAIL_FROM=your_email@gmail.com
-EMAIL_TO=recipient1@example.com,recipient2@example.com
-
-# База данных
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/avito_monitor
-
-# Анализ
-UNDERVALUE_THRESHOLD=0.8
-
-# Хранение
-RAW_HTML_PATH=data/raw_html
-
-# Логирование
-LOG_LEVEL=INFO
-```
+| Параметр | Назначение |
+|---|---|
+| `MAX_CONCURRENT_SEARCHES` | Количество параллельных поисков в одном батче (ограничение Semaphore) |
+| `DEFAULT_SCHEDULE_INTERVAL_HOURS` | Интервал запуска по умолчанию для новых поисков в БД |
+| `DEFAULT_MAX_ADS_TO_PARSE` | Карточек на поиск за запуск по умолчанию для новых поисков |
+| `BATCH_DELAY_SECONDS` | Пауза между обработкой батчей поисков |
+| `SEARCH_DELAY_SECONDS` | Пауза между запусками поисков внутри батча |
 
 ---
 
 ## 6. Алгоритм одного запуска
 
-### Общий алгоритм `run_single_cycle()`
+### Общий алгоритм `run_search_cycle()`
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    START: run_single_cycle                   │
+│              START: Pipeline.run_search_cycle()               │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            ▼
-                ┌──────────────────────┐
-                │ 1. Загрузить конфиг  │
-                │ 2. Случайная задержка │
-                │    перед стартом      │
-                └──────────┬───────────┘
+                ┌──────────────────────────┐
+                │ 1. Получить поиски,      │
+                │    готовые к запуску     │
+                │    (get_searches_due)    │
+                └──────────┬───────────────┘
                            │
-                           ▼
-                ┌──────────────────────┐
-                │ 3. Подключиться к БД │
-                │ 4. Запустить браузер │
-                └──────────┬───────────┘
+                ┌──────────┴───────────────┐
+                │ Есть поиски для запуска? │
+                └──────────┬───────────────┘
+                     Нет   │   Да
+                    ───────┘   │
+                              ▼
+                ┌──────────────────────────┐
+                │ 2. Разбить на батчи по   │
+                │    MAX_CONCURRENT_       │
+                │    SEARCHES             │
+                └──────────┬───────────────┘
                            │
               ┌────────────┴────────────┐
-              │  ДЛЯ КАЖДОГО search_url │
-              │  из search_urls         │
+              │ ДЛЯ КАЖДОГО БАТЧА       │
               └────────────┬────────────┘
-                           │
-                           ▼
-              ┌─────────────────────────────┐
-              │ 5. Случайная задержка        │
-              │ 6. Открыть поисковую страницу│
-              │ 7. Сохранить HTML на диск    │
-              │ 8. Создать SearchRun в БД    │
-              └────────────┬────────────────┘
                            │
                            ▼
               ┌─────────────────────────────────────┐
-              │ 9.  Парсинг HTML → list[SearchResult]│
-              │ 10. Получить recent_ad_ids из БД     │
-              │ 11. Отфильтровать уже известные      │
-              │ 12. Выбрать max_ads новых            │
-              └────────────┬────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              │ ДЛЯ КАЖДОГО нового ad   │
-              └────────────┬────────────┘
-                           │
-                           ▼
-              ┌──────────────────────────────────────┐
-              │ 13. Случайная задержка                │
-              │ 14. Открыть карточку объявления       │
-              │ 15. Сохранить HTML на диск            │
-              │ 16. Парсинг HTML → AdData             │
-              │ 17. Сохранить/обновить Ad в БД        │
-              │ 18. Сохранить AdSnapshot в БД         │
+              │ 3. Запустить поиски параллельно      │
+              │    через asyncio.Semaphore            │
+              │    с задержкой SEARCH_DELAY_SECONDS   │
               └────────────┬─────────────────────────┘
                            │
                            ▼
-              ┌──────────────────────────────────────┐
-              │ 19. Обновить SearchRun: completed     │
-              │     ads_found, ads_new                │
+              ┌─────────────────────────────────────┐
+              │ 4. Задержка BATCH_DELAY_SECONDS      │
+              │    перед следующим батчем             │
               └────────────┬─────────────────────────┘
                            │
                            ▼
-              ┌──────────────────────────────────────┐
-              │ === Фаза анализа ===                  │
-              │ 20. Для каждого search_url:           │
-              │     - calculate_market_stats()        │
-              │     - detect_undervalued()            │
-              │ 21. Пометить undervalued ads в БД     │
+              ┌─────────────────────────────────────┐
+              │ === Фаза анализа v2 ===               │
+              │ 5. Для каждого поиска:                │
+              │    a. get_ads_for_analysis()          │
+              │    b. segment_ads()                   │
+              │    c. Для каждого сегмента:           │
+              │       - filter_iqr()                  │
+              │       - calculate_market_stats()      │
+              │       - detect_undervalued_v2()       │
+              │    d. update_ad_analysis()             │
               └────────────┬─────────────────────────┘
                            │
                            ▼
+              ┌─────────────────────────────────────┐
+              │ === Фаза уведомлений ===              │
+              │ 6. Для каждого undervalued ad:        │
+              │    - Проверить is_notification_sent   │
+              │    - Попытка отправить в Telegram     │
+              │    - Fallback на Email (SMTP)         │
+              │    - Записать notification_sent в БД  │
+              └────────────┬─────────────────────────┘
+                           │
+                           ▼
+              ┌─────────────────────────────────────┐
+              │ 7. Обновить last_run_at для поисков   │
+              │ 8. Вернуть статистику                 │
+              └─────────────────────────────────────┘
+```
+
+### Обработка одного поискового запроса `_process_tracked_search()`
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│         _process_tracked_search(search)                       │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+               ┌─────────────────────────────┐
+               │ 1. Случайная задержка        │
+               │ 2. Открыть поисковую страницу│
+               │ 3. Сохранить HTML на диск    │
+               │ 4. Создать SearchRun в БД    │
+               └────────────┬────────────────┘
+                            │
+                            ▼
+               ┌─────────────────────────────────────┐
+               │ 5.  Парсинг HTML → list[SearchResult]│
+               │ 6. Получить recent_ad_ids из БД      │
+               │ 7. Отфильтровать уже известные       │
+               │ 8. Выбрать max_ads новых             │
+               └────────────┬────────────────────────┘
+                            │
+               ┌────────────┴────────────┐
+               │ ДЛЯ КАЖДОГО нового ad   │
+               └────────────┬────────────┘
+                            │
+                            ▼
                ┌──────────────────────────────────────┐
-               │ === Фаза уведомлений ===              │
-               │ 22. Для каждого undervalued ad:       │
-               │     - Проверить is_notification_sent  │
-               │     - Попытка отправить в Telegram    │
-               │     - Если Telegram недоступен —      │
-               │       fallback на Email (SMTP)        │
-               │     - Записать notification_sent в БД │
+               │ 9.  Случайная задержка                │
+               │ 10. Открыть карточку объявления       │
+               │ 11. Сохранить HTML на диск            │
+               │ 12. Парсинг HTML → AdData             │
+               │ 13. Сохранить/обновить Ad в БД        │
+               │ 14. Сохранить AdSnapshot в БД         │
                └────────────┬─────────────────────────┘
                             │
                             ▼
                ┌──────────────────────────────────────┐
-               │ 23. Отправить summary в Telegram      │
-               │     (или fallback на Email)           │
-               │ 24. Закрыть браузер                   │
-               │ 25. Закрыть подключение к БД          │
-               │ 26. Записать результаты в лог         │
-              └────────────┬─────────────────────────┘
-                           │
-                           ▼
-                ┌──────────────────────┐
-                │       END            │
-                └──────────────────────┘
-```
-
-### Псевдокод
-
-```python
-async def run_single_cycle(self) -> None:
-    logger.info("Starting collection cycle")
-
-    # 1. Startup delay
-    await random_delay(self.settings.startup_delay_min, self.settings.startup_delay_max)
-
-    # 2. Init
-    await self.collector.start()
-    total_new = 0
-    total_found = 0
-
-    # 3. For each search URL
-    for search_url in self.settings.search_urls:
-        try:
-            await self._process_search(search_url)
-        except Exception as e:
-            logger.error("Failed to process search", search_url=search_url, error=str(e))
-
-    # 4. Analysis phase
-    all_undervalued = []
-    for search_url in self.settings.search_urls:
-        undervalued = await self.price_analyzer.detect_undervalued(search_url)
-        for uv in undervalued:
-            await self.repository.mark_ad_undervalued(uv.ad.ad_id, uv.undervalue_score)
-            all_undervalued.append(uv)
-
-    # 5. Notification phase (Telegram → Email fallback)
-    telegram_failed = False
-    for uv in all_undervalued:
-        already_sent = await self.repository.is_notification_sent(uv.ad.ad_id)
-        if not already_sent:
-            msg_id = await self.notifier.send_undervalued_notification(
-                uv.ad, uv.stats, uv.undervalue_score
-            )
-            if msg_id:
-                await self.repository.mark_notification_sent(
-                    uv.ad.ad_id, "undervalued", msg_id
-                )
-            else:
-                telegram_failed = True
-
-    # Fallback: отправить через Email, если Telegram не смог
-    if telegram_failed and all_undervalued:
-        unsent = [uv for uv in all_undervalued
-                  if not await self.repository.is_notification_sent(uv.ad.ad_id)]
-        if unsent:
-            await self.email_notifier.send_undervalued_notifications(unsent)
-
-    # 6. Summary
-    await self.notifier.send_cycle_summary(total_found, total_new, len(all_undervalued))
-    await self.collector.stop()
-    logger.info("Collection cycle completed")
-
-async def _process_search(self, search_url: str) -> None:
-    """Обработка одного поискового запроса."""
-    # Delay
-    await random_delay(self.settings.min_delay_seconds, self.settings.max_delay_seconds)
-
-    # Get or create tracked search
-    tracked_search = await self.repository.get_or_create_tracked_search(search_url, ...)
-    search_run = await self.repository.create_search_run(tracked_search.id)
-
-    try:
-        # Collect search page HTML
-        html = await self.collector.collect_search_page(search_url)
-        html_path = self.html_storage.save_search_html(html, search_url)
-
-        # Parse search results
-        search_results = parse_search_page(html, search_url)
-        logger.info("Parsed search results", url=search_url, count=len(search_results))
-
-        # Deduplication
-        recent_ids = await self.repository.get_recent_ad_ids(search_url)
-        new_results = [r for r in search_results if r.ad_id not in recent_ids]
-        new_results = new_results[:self.settings.max_ads_per_search_per_run]
-
-        # Process each new ad
-        for result in new_results:
-            await self._process_ad(result, search_url, tracked_search.id)
-
-        # Complete run
-        await self.repository.complete_search_run(
-            search_run.id,
-            ads_found=len(search_results),
-            ads_new=len(new_results),
-        )
-
-    except Exception as e:
-        await self.repository.fail_search_run(search_run.id, str(e))
-        raise
-
-async def _process_ad(self, result: SearchResult, search_url: str, tracked_search_id: int) -> None:
-    """Обработка одного объявления."""
-    # Delay
-    await random_delay(self.settings.min_delay_seconds, self.settings.max_delay_seconds)
-
-    # Get or create ad record
-    ad, created = await self.repository.get_or_create_ad(
-        result.ad_id, result.url, search_url, tracked_search_id
-    )
-
-    try:
-        # Collect ad page HTML
-        html = await self.collector.collect_ad_page(result.url)
-        html_path = self.html_storage.save_ad_html(html, result.ad_id)
-
-        # Parse ad data
-        ad_data = parse_ad_page(html, result.url)
-        ad_data.search_url = search_url
-
-        # Update ad in DB (sets parse_status='parsed')
-        await self.repository.update_ad_data(result.ad_id, ad_data)
-
-        # Save snapshot
-        if ad_data.price is not None:
-            await self.repository.save_ad_snapshot(result.ad_id, ad_data.price, html_path)
-
-    except Exception as e:
-        logger.error("Failed to process ad", ad_id=result.ad_id, error=str(e))
-        await self.repository.mark_ad_parse_failed(result.ad_id, str(e))
+               │ 15. Обновить SearchRun: completed     │
+               │ 16. Обновить search.last_run_at       │
+               └──────────────────────────────────────┘
 ```
 
 ---
 
 ## 7. Поток данных
 
-### Диаграмма потока данных
+### Диаграмма потока данных при масштабированном поиске
 
 ```mermaid
-flowchart LR
-    A[search_urls из конфига] --> B[Collector: Playwright]
-    B --> C[HTML поисковых страниц]
-    C --> D[HtmlStorage: сохранение на диск]
-    C --> E[SearchParser: извлечение ссылок]
-    E --> F[list of SearchResult]
-    F --> G[Repository: дедупликация по recent_ad_ids]
-    G --> H[Отфильтрованные новые объявления]
-    H --> I[Collector: открытие карточек]
-    I --> J[HTML карточек]
-    J --> K[HtmlStorage: сохранение на диск]
-    J --> L[AdParser: извлечение данных]
-    L --> M[AdData - структурированные данные]
-    M --> N[Repository: сохранение в PostgreSQL]
-    N --> O[PriceAnalyzer: расчёт медианы и Q1]
-    O --> P[Список UndervaluedAd]
-    P --> Q{Telegram доступен?}
-    Q -->|Да| R[TelegramNotifier: отправка в Telegram]
-    Q -->|Нет| S[EmailNotifier: отправка по SMTP]
-    R --> T[Repository: запись notification_sent]
-    S --> T
+flowchart TD
+    A[Scheduler: каждые 5 мин] --> B[Pipeline.run_search_cycle]
+    B --> C[Repository: get_searches_due_for_run]
+    C --> D{Есть просроченные поиски?}
+    D -- Нет --> E[Sleep 5 мин]
+    D -- Да --> F[Разбить на батчи по MAX_CONCURRENT_SEARCHES]
+
+    F --> G[Батч 1: asyncio.gather + Semaphore]
+    F --> H[Батч 2: ...]
+    F --> I[Батч N: ...]
+
+    G --> J[_process_tracked_search]
+    J --> K[Collector: Playwright]
+    K --> L[HTML поисковых страниц]
+    L --> M[SearchParser: извлечение ссылок]
+    M --> N[Repository: дедупликация]
+    N --> O[Collector: открытие карточек]
+    O --> P[HTML карточек]
+    P --> Q[AdParser: извлечение данных + seller_type]
+    Q --> R[Repository: сохранение в PostgreSQL]
+
+    R --> S[_analyze_and_notify_searches]
+    S --> T[Repository: get_ads_for_analysis]
+    T --> U[PriceAnalyzer: segment_ads]
+    U --> V[Для каждого сегмента: filter_iqr + calculate_stats]
+    V --> W[detect_undervalued_v2: составной score]
+    W --> X[Repository: update_ad_analysis]
+    X --> Y{Telegram доступен?}
+    Y -->|Да| Z[TelegramNotifier]
+    Y -->|Нет| AA[EmailNotifier: fallback]
+    Z --> AB[Repository: notification_sent]
+    AA --> AB
 ```
 
 ### Подробное описание потока
 
 | Этап | Вход | Модуль | Выход | Хранилище |
 |------|------|--------|-------|-----------|
-| 1. Сбор поисковой страницы | `search_url: str` | `AvitoCollector.collect_search_page()` | `html: str` | `data/raw_html/search/` |
-| 2. Парсинг поиска | `html: str` | `parse_search_page()` | `list[SearchResult]` | — |
-| 3. Дедупликация | `list[SearchResult]` | `Repository.get_recent_ad_ids()` | Отфильтрованный список | PostgreSQL |
-| 4. Сбор карточки | `url: str` | `AvitoCollector.collect_ad_page()` | `html: str` | `data/raw_html/ad/` |
-| 5. Парсинг карточки | `html: str` | `parse_ad_page()` | `AdData` | — |
-| 6. Сохранение данных | `AdData` | `Repository` | Записи в таблицах | PostgreSQL + диск |
-| 7. Ценовой анализ | `search_url` | `PriceAnalyzer` | `list[UndervaluedAd]` | PostgreSQL |
-| 8. Уведомление | `UndervaluedAd` | `TelegramNotifier` / `EmailNotifier` (fallback) | `telegram_message_id` или email | PostgreSQL + Telegram/SMTP |
+| 1. Выбор поисков | `schedule_interval_hours`, `last_run_at` | `Repository.get_searches_due_for_run()` | `list[TrackedSearch]` | PostgreSQL |
+| 2. Батчевая обработка | `list[TrackedSearch]` | `Pipeline` (Semaphore) | Результаты по поисков | — |
+| 3. Сбор поисковой страницы | `search_url: str` | `AvitoCollector.collect_search_page()` | `html: str` | `data/raw_html/search/` |
+| 4. Парсинг поиска | `html: str` | `parse_search_page()` | `list[SearchResult]` | — |
+| 5. Дедупликация | `list[SearchResult]` | `Repository.get_recent_ad_ids()` | Отфильтрованный список | PostgreSQL |
+| 6. Сбор карточки | `url: str` | `AvitoCollector.collect_ad_page()` | `html: str` | `data/raw_html/ad/` |
+| 7. Парсинг карточки | `html: str` | `parse_ad_page()` | `AdData` (с `seller_type`) | — |
+| 8. Сохранение данных | `AdData` | `Repository` | Записи в таблицах | PostgreSQL + диск |
+| 9. Ценовой анализ v2 | `tracked_search_id` | `PriceAnalyzer` (сегментация, IQR, Z-score) | `list[UndervaluedResult]` | PostgreSQL |
+| 10. Обновление анализа | `UndervaluedResult` | `Repository.update_ad_analysis()` | z_score, iqr_outlier, segment_key | PostgreSQL |
+| 11. Уведомление | `UndervaluedResult` | `TelegramNotifier` / `EmailNotifier` | `telegram_message_id` или email | PostgreSQL + Telegram/SMTP |
 
 ---
 
-## 8. Обработка ошибок
+## 8. Аналитический движок v2
+
+### Обзор
+
+Аналитический движок v2 в [`app/analysis/analyzer.py`](app/analysis/analyzer.py) реализует продвинутый статистический анализ цен с сегментацией, фильтрацией выбросов и составным критерием недооценённости.
+
+### Архитектура анализа
+
+```mermaid
+flowchart TD
+    A[Все объявления для tracked_search] --> B[Временной фильтр: TEMPORAL_WINDOW_DAYS]
+    B --> C[Сегментация: condition + location + seller_type]
+    C --> D{Размер сегмента >= MIN_SEGMENT_SIZE?}
+    D -- Нет --> E[Объединение сегментов / fallback]
+    E --> D
+    D -- Да --> F[Trim: убрать TRIM_PERCENT дешёвых и дорогих]
+    F --> G[IQR-фильтрация: IQR_MULTIPLIER]
+    G --> H[Расчёт статистики: median, Q1, Q3, IQR, std, trimmed_mean]
+    H --> I[Z-score для каждого объявления]
+    I --> J[Составной undervalue_score]
+    J --> K{score > UNDERVALUED_THRESHOLD?}
+    K -- Да --> L[Объявление недооценено]
+    K -- Нет --> M[Объявление в норме]
+    L --> N[update_ad_analysis в БД]
+    M --> N
+```
+
+### Сегментация
+
+Объявления группируются по составному ключу `{condition}_{location}_{seller_type}`:
+
+| Компонент | Источник | Примеры |
+|---|---|---|
+| condition | `Ad.condition` | «Новое», «Б/у», «Не указано» |
+| location | `Ad.location` (первый компонент) | «Москва», «Екатеринбург» |
+| seller_type | `Ad.seller_type` | «частное», «магазин», «компания» |
+
+Пример ключа: `"Новое_Москва_частное"`
+
+Если размер сегмента < `MIN_SEGMENT_SIZE`, сегмент объединяется с менее гранулярным.
+
+### IQR-фильтрация
+
+Метод [`filter_iqr()`](app/analysis/analyzer.py) удаляет статистические выбросы:
+
+```
+Q1 = percentile(prices, 25)
+Q3 = percentile(prices, 75)
+IQR = Q3 - Q1
+Lower Fence = Q1 - IQR_MULTIPLIER × IQR
+Upper Fence = Q3 + IQR_MULTIPLIER × IQR
+Выброс: price < Lower Fence ИЛИ price > Upper Fence
+```
+
+### Z-score анализ
+
+Метод [`calculate_zscore()`](app/analysis/analyzer.py) рассчитывает стандартное отклонение цены от среднего:
+
+```
+z = (price - μ) / σ
+Аномалия: z < -ZSCORE_THRESHOLD
+```
+
+### Составной undervalue_score
+
+Метод [`detect_undervalued_v2()`](app/analysis/analyzer.py) вычисляет взвешенный score:
+
+```
+iqr_score = max(0, (Q1 - price) / IQR)           если IQR > 0
+zscore_score = max(0, -z_score / ZSCORE_THRESHOLD) если z_score < 0
+median_score = max(0, (median - price) / median)  если price < median
+
+undervalue_score = 0.4 × iqr_score + 0.3 × zscore_score + 0.3 × median_score
+```
+
+Объявление считается **недооценённым**, если:
+- `undervalue_score > UNDERVALUED_THRESHOLD` (по умолчанию 0.3)
+- И при этом `iqr_score > 0` ИЛИ `zscore_score > 0`
+
+### Расширенная MarketStats
+
+[`MarketStats`](app/analysis/analyzer.py) содержит расширенный набор метрик:
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `median_price` | `float` | Медиана цен |
+| `mean_price` | `float` | Среднее цен |
+| `q1_price` | `float` | Первый квартиль (25-й перцентиль) |
+| `q3_price` | `float \| None` | Третий квартиль (75-й перцентиль) |
+| `iqr` | `float \| None` | Межквартильный размах: Q3 - Q1 |
+| `std_dev` | `float \| None` | Стандартное отклонение |
+| `lower_fence` | `float \| None` | Нижняя граница IQR |
+| `upper_fence` | `float \| None` | Верхняя граница IQR |
+| `trimmed_mean` | `float \| None` | Среднее после удаления выбросов |
+| `segment_key` | `str` | Ключ сегмента |
+| `sample_size` | `int` | Размер выборки |
+
+---
+
+## 9. Архитектура планировщика
+
+### Обзор
+
+Двухуровневая архитектура: [`Scheduler`](app/scheduler/scheduler.py) → [`Pipeline`](app/scheduler/pipeline.py).
+
+```mermaid
+flowchart TD
+    A[CLI: python -m app.main run] --> B[Scheduler.run]
+    B --> C[Цикл: каждые 5 минут]
+    C --> D[Pipeline.run_search_cycle]
+    D --> E[Repository.get_searches_due_for_run]
+    E --> F{Просроченные поиски?}
+    F -- Да --> G[Батчевая обработка]
+    F -- Нет --> H[Sleep 5 мин]
+    G --> I[Анализ + уведомления]
+    I --> H
+    H --> C
+```
+
+### Scheduler
+
+Класс [`Scheduler`](app/scheduler/scheduler.py:14) реализует циклический планировщик:
+
+- **Интервал проверки**: 5 минут (3000 секунд)
+- **Обработка**: делегирует [`Pipeline.run_search_cycle()`](app/scheduler/pipeline.py)
+- **Отказоустойчивость**: исключения в одном цикле не прерывают работу
+- **Остановка**: через `Scheduler.stop()` — текущий цикл завершается корректно
+
+### Pipeline
+
+Класс [`Pipeline`](app/scheduler/pipeline.py) реализует обработку поисков:
+
+#### Батчевая обработка
+
+Поиски разбиваются на батчи по `MAX_CONCURRENT_SEARCHES` и обрабатываются параллельно:
+
+```
+Батч 1: [Search 1, Search 2, Search 3]  ← asyncio.gather + Semaphore(3)
+    ↓ BATCH_DELAY_SECONDS (30 сек)
+Батч 2: [Search 4, Search 5, Search 6]
+    ↓ BATCH_DELAY_SECONDS
+...
+```
+
+Внутри каждого батча между запусками поисков задержка `SEARCH_DELAY_SECONDS` (5 сек).
+
+#### Управление расписанием
+
+Каждый `TrackedSearch` имеет:
+- `schedule_interval_hours` — индивидуальный интервал запуска (по умолчанию 2 часа)
+- `last_run_at` — время последнего запуска
+- `priority` — приоритет (1–10, ниже = важнее)
+- `max_ads_to_parse` — лимит карточек за запуск
+
+Поиск считается готовым к запуску если:
+```
+last_run_at IS NULL
+  ИЛИ
+last_run_at + schedule_interval_hours <= NOW()
+```
+
+---
+
+## 10. Обработка ошибок
 
 ### Стратегия
 
@@ -1483,10 +1567,14 @@ flowchart LR
 |---------|-----------|--------|
 | **Отдельное объявление** | Логировать ошибку, продолжить со следующего | Не удалось распарсить цену |
 | **Отдельный поиск** | Логировать ошибку, отметить SearchRun как failed, продолжить со следующего URL | Страница не загрузилась |
+| **Батч поисков** | Ошибки отдельных поисков не прерывают батч | Один из 3 поисков упал |
+| **Цикл планировщика** | Логировать ошибку, sleep до следующего цикла | Все поиски упали |
 | **База данных** | Логировать и завершить цикл с ошибкой | Нет подключения к PostgreSQL |
 | **Браузер** | Логировать и завершить цикл с ошибкой | Chromium не установлен |
 
 ### Кастомные исключения
+
+Определены в [`app/utils/exceptions.py`](app/utils/exceptions.py):
 
 ```python
 class AvitoMonitorError(Exception):
@@ -1510,99 +1598,130 @@ class NotificationError(AvitoMonitorError):
     pass
 ```
 
+### IntegrityError в get_or_create_ad
+
+[`Repository.get_or_create_ad()`](app/storage/repository.py) обрабатывает `IntegrityError` при конкурентной вставке: если два процесса одновременно пытаются создать одно объявление, второй получит уже существующую запись вместо ошибки.
+
 ---
 
-## 9. Логирование
+## 11. Логирование
 
 ### Настройка
 
-Используется `structlog` для структурированного логирования. Настройка в `app/main.py`.
-
-```python
-import structlog
-
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.dev.ConsoleRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-```
+Используется `structlog` для структурированного логирования. Настройка в [`app/utils/helpers.py`](app/utils/helpers.py) через `setup_logging()`.
 
 ### Ключевые события для логирования
 
 | Событие | Уровень | Поля |
 |---------|---------|------|
-| Старт цикла | INFO | `search_urls_count` |
+| Старт планировщика | INFO | — |
+| Начало цикла планировщика | INFO | — |
+| Конец цикла планировщика | INFO | статистика цикла |
+| Ошибка цикла планировщика | ERROR | error, exc_info |
 | Открытие поисковой страницы | INFO | `search_url`, `delay_seconds` |
 | Результат парсинга поиска | INFO | `search_url`, `ads_found`, `ads_new` |
 | Открытие карточки | INFO | `ad_id`, `url` |
 | Результат парсинга карточки | INFO | `ad_id`, `title`, `price` |
-| Обнаружено undervalued | WARNING | `ad_id`, `price`, `median`, `score` |
+| Сегментация объявлений | INFO | `segment_count`, `ads_count` |
+| Обнаружено undervalued v2 | WARNING | `ad_id`, `price`, `score`, `segment_key` |
 | Уведомление отправлено | INFO | `ad_id`, `telegram_message_id` |
 | Telegram недоступен, fallback на Email | WARNING | `error` |
-| Email-уведомление отправлено | INFO | `ad_id`, `email_to` |
-| Ошибка отправки email | ERROR | `error` |
 | Ошибка парсинга объявления | ERROR | `ad_id`, `error` |
 | Ошибка загрузки страницы | ERROR | `url`, `error` |
 | Завершение цикла | INFO | `total_found`, `total_new`, `undervalued_count` |
 
 ---
 
-## 10. CLI — точка входа
+## 12. CLI — точка входа
 
-### `app/main.py`
+### `app/scheduler/cli.py`
+
+CLI реализован на Typer в [`app/scheduler/cli.py`](app/scheduler/cli.py).
 
 ```python
 import typer
 import asyncio
-from app.config.settings import AppSettings
 
-app = typer.Typer(name="avito-monitor", help="Avito Monitor PoC")
+app = typer.Typer(name="avito-monitor", help="Avito Monitor")
 
 @app.command()
 def run():
+    """Запустить циклический планировщик (каждые 5 минут)."""
+    settings = Settings()
+    asyncio.run(_run_scheduler(settings))
+
+@app.command()
+def run_once():
     """Запустить один цикл сбора и анализа."""
-    settings = AppSettings()
-    asyncio.run(_run_cycle(settings))
+    settings = Settings()
+    asyncio.run(_run_once(settings))
 
 @app.command()
 def init_db():
-    """Инициализировать базу данных — создать таблицы."""
-    settings = AppSettings()
+    """Инициализировать базу данных — создать таблицы + миграции."""
+    settings = Settings()
     asyncio.run(_init_db(settings))
 
-async def _run_cycle(settings: AppSettings) -> None:
-    """Асинхронный запуск полного цикла."""
+@app.command()
+def test_telegram():
+    """Проверить подключение к Telegram."""
+    settings = Settings()
+    asyncio.run(_test_telegram(settings))
+```
+
+### Вспомогательные функции CLI
+
+```python
+async def _ensure_tables(settings: Settings) -> None:
+    """Создать таблицы, если они не существуют."""
     ...
 
-async def _init_db(settings: AppSettings) -> None:
-    """Создание таблиц в БД."""
+async def _seed_searches(settings: Settings) -> None:
+    """Заполнить поисковые запросы из SEARCH_URLS в БД."""
     ...
-
-if __name__ == "__main__":
-    app()
 ```
 
 ### Запуск
 
 ```bash
+# Циклический планировщик
+python -m app.main run
+
+# Один цикл
+python -m app.main run-once
+
 # Инициализация БД
 python -m app.main init-db
 
-# Запуск одного цикла
-python -m app.main run
+# Проверка Telegram
+python -m app.main test-telegram
 ```
 
 ---
 
-## 11. Зависимости
+## 13. Скрипты утилиты
+
+### `scripts/init_db.py` — Инициализация БД + миграции
+
+Создаёт таблицы и выполняет миграции новых колонок в существующие таблицы PostgreSQL.
+
+Функция `_migrate_existing_db()` добавляет колонки, добавленные в v2:
+- `tracked_searches`: `schedule_interval_hours`, `last_run_at`, `priority`, `max_ads_to_parse`
+- `ads`: `seller_type`, `z_score`, `iqr_outlier`, `segment_key`
+
+Миграция идемпотентна: использует `IF NOT EXISTS` для каждой колонки.
+
+### `scripts/seed_searches.py` — Заполнение поисковых запросов
+
+Читает `SEARCH_URLS` из `.env` и создаёт записи `TrackedSearch` в БД для каждого URL. Использует `get_or_create_tracked_search()` для дедупликации.
+
+### `scripts/cleanup_duplicates.py` — Очистка дубликатов
+
+Удаляет дубликаты объявлений из таблицы `ads`, оставляя самую свежую запись для каждого `avito_id`.
+
+---
+
+## 14. Зависимости
 
 ### `requirements.txt`
 
@@ -1618,6 +1737,7 @@ typer>=0.9.0
 structlog>=23.0.0
 python-dotenv>=1.0.0
 aiosmtplib>=3.0.0
+numpy>=1.24.0
 ```
 
 ### Установка Playwright
@@ -1629,40 +1749,40 @@ playwright install chromium
 
 ---
 
-## 12. Ограничения и допущения
+## 15. Ограничения и допущения
 
-### Текущие ограничения PoC
+### Текущие ограничения
 
 1. **Нет пагинации:** обрабатывается только первая страница поиска
 2. **Нет авторизации:** не обрабатываются объявления требующие входа
 3. **Нет ротации прокси:** `USE_PROXY = False` по умолчанию
-4. **Нет расписания:** запуск только вручную через CLI
-5. **Простой анализ:** только медиана и Q1, без ML
-6. **Нет CAPTCHA-handling:** при появлении CAPTCHA цикл завершится с ошибкой
+4. **Нет CAPTCHA-handling:** при появлении CAPTCHA цикл завершится с ошибкой
+5. **Миграции без Alembic:** миграции выполняются скриптом `init_db.py` с `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
 
 ### Допущения
 
-1. Селекторы Avito могут меняться — для этого предусмотрен `selectors.py` с fallback-селекторами
+1. Селекторы Avito могут меняться — для этого предусмотрен fallback-механизм в парсерах
 2. Формат URL объявлений: `https://www.avito.ru/{city}/{category}/{title}-{ad_id}`
 3. Цена указана в рублях, целое число
 4. Достаточно одной инстанции PostgreSQL на локальной машине
+5. Планировщик работает в одном процессе (нет горизонтального масштабирования)
 
 ### Точки расширения
 
 | Что | Как расширить |
 |-----|---------------|
 | Прокси | Установить `USE_PROXY=True`, указать `PROXY_URL` — `AvitoCollector` автоматически использует его |
-| Расписание | Добавить cron/systemd/Task Scheduler на `python -m app.main run` |
 | Пагинация | Добавить параметр `?page=N` к URL, цикл по страницам в `_process_search` |
-| Новый канал уведомлений | Реализовать новый класс с методом `send_undervalued_notification` (пример: [`EmailNotifier`](app/notifier/email_notifier.py)) |
+| Новый канал уведомлений | Реализовать новый класс с методом `send_undervalued_notification` |
 | ML-анализ | Расширить `PriceAnalyzer` или создать новый класс рядом |
-| Больше поисков | Добавить URL в `SEARCH_URLS` в `.env` |
+| Больше поисков | Добавить через `seed_searches.py` или напрямую в БД |
+| Alembic | Настроить Alembic для полноценного управления миграциями |
 
 ---
 
-## 13. Ключевые паттерны
+## 16. Ключевые паттерны
 
-### 13.1 Разделение сырых HTML и структурированных данных
+### 16.1 Разделение сырых HTML и структурированных данных
 
 Система строго разделяет два слоя хранения:
 
@@ -1671,27 +1791,19 @@ playwright install chromium
 | Сырые данные | Файловая система `data/raw_html/` | Полный HTML-код страниц | Возможность перепарсинга без повторного сбора |
 | Структурированные данные | PostgreSQL | Извлечённые поля, метаданные | Анализ, поиск, уведомления |
 
-**Поток:**
-
-1. `Collector` получает HTML через Playwright
-2. `HtmlStorage.save_*()` записывает файл на диск, возвращает путь
-3. `Parser` извлекает структурированные данные из HTML
-4. `Repository` сохраняет структурированные данные в БД, включая `html_path`
-5. `ad_snapshots.html_path` хранит ссылку на файл для повторного парсинга
-
 **Преимущества:**
 - Можно перепарсить HTML без обращения к Avito
 - Можно отладить парсер на сохранённых файлах
 - Исторические данные не теряются при изменении селекторов
 
-### 13.2 Дедупликация объявлений
+### 16.2 Дедупликация объявлений
 
 **Уникальность объявления** определяется по `ad_id` (числовой ID из URL Avito).
 
 **Алгоритм дедупликации при обработке поиска:**
 
 1. `parse_search_page()` извлекает `list[SearchResult]` с `ad_id` для каждого
-2. `Repository.get_recent_ad_ids(search_url, hours=24)` возвращает множество `ad_id`, которые уже проверялись за последние 24 часа
+2. `Repository.get_recent_ad_ids(search_url, hours=24)` возвращает множество `ad_id`
 3. Фильтрация: `new_results = [r for r in search_results if r.ad_id not in recent_ids]`
 4. Ограничение: `new_results = new_results[:max_ads_per_search_per_run]`
 
@@ -1704,9 +1816,9 @@ playwright install chromium
 | `failed` | При парсинге произошла ошибка (см. `last_error`) |
 | `skipped` | Объявление пропущено — например, уже проверялось |
 
-### 13.3 Нормализация цены
+### 16.3 Нормализация цены
 
-Цена всегда хранится в БД как `INTEGER` (рубли, без копеек). Функция `normalize_price()` в `ad_parser.py` обрабатывает все варианты формата Avito:
+Цена всегда хранится в БД как `INTEGER` (рубли, без копеек). Функция `normalize_price()` обрабатывает все варианты формата Avito:
 
 - Удаляет неразрывные пробелы (`\xa0`)
 - Удаляет обычные пробелы и запятые
@@ -1714,7 +1826,7 @@ playwright install chromium
 - Извлекает числовую часть через regex
 - Возвращает `int` или `None`
 
-### 13.4 Дедупликация уведомлений
+### 16.4 Дедупликация уведомлений
 
 Таблица `notifications_sent` имеет `UNIQUE` индекс на `(ad_id, notification_type)`. Это гарантирует:
 
@@ -1723,17 +1835,27 @@ playwright install chromium
 - После успешной отправки записывается `Repository.mark_notification_sent(ad_id, type, msg_id)`
 - Повторный запуск цикла не вызовет дублирование уведомлений
 
-### 13.5 Слой адаптации селекторов
+### 16.5 Сегментация рынка
 
-Все CSS-селекторы вынесены в отдельный файл `app/parser/selectors.py`. Каждый селектор — это `list[str]` с fallback-вариантами. Парсер пробует селекторы по порядку:
+Объявления сегментируются перед анализом для корректного сравнения:
 
-```python
-def _extract_with_fallback(soup: BeautifulSoup, selectors: list[str]) -> str | None:
-    for selector in selectors:
-        element = soup.select_one(selector)
-        if element:
-            return element.get_text(strip=True)
-    return None
-```
+- «Новый iPhone в Москве» сравнивается только с «новыми iPhone в Москве от частных продавцов»
+- Ключ сегмента: `{condition}_{location}_{seller_type}`
+- Если сегмент слишком мал (< `MIN_SEGMENT_SIZE`), происходит объединение
 
-При изменении вёрстки Avito достаточно обновить `selectors.py` — бизнес-логика парсера не меняется.
+### 16.6 Пакетная обработка с Semaphore
+
+Пайплайн использует `asyncio.Semaphore` для ограничения параллельности:
+
+- `MAX_CONCURRENT_SEARCHES` — максимальное количество одновременных поисков
+- Между батчами задержка `BATCH_DELAY_SECONDS`
+- Между поисками внутри батча задержка `SEARCH_DELAY_SECONDS`
+- Ошибка одного поиска не прерывает обработку батча
+
+### 16.7 Идемпотентные миграции
+
+Скрипт [`scripts/init_db.py`](scripts/init_db.py) выполняет миграции через `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, что обеспечивает:
+
+- Безопасный повторный запуск
+- Добавление новых колонок без потери данных
+- Совместимость с существующими инсталляциями

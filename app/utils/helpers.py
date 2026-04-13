@@ -153,3 +153,31 @@ def setup_logging(level: str) -> None:
         format="%(message)s",
         level=getattr(logging, level.upper(), logging.INFO),
     )
+
+
+def build_avito_url(query: str, location: str = "Москва") -> str:
+    """Построить URL поиска Avito по запросу и локации.
+
+    Args:
+        query: Поисковый запрос.
+        location: Город/регион.
+
+    Returns:
+        URL для поиска на Avito.
+    """
+    location_map = {
+        "москва": "moskva",
+        "санкт-петербург": "sankt-peterburg",
+        "петербург": "sankt-peterburg",
+        "екатеринбург": "ekaterinburg",
+        "новосибирск": "novosibirsk",
+        "россия": "rossiya",
+    }
+    location_slug = location_map.get(location.lower(), location.lower())
+
+    encoded_query = query.replace(" ", "+")
+
+    return (
+        f"https://www.avito.ru/{location_slug}"
+        f"?q={encoded_query}&s=104"
+    )

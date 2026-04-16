@@ -9,6 +9,7 @@ from app.utils.exceptions import (
     StorageError,
 )
 from app.utils.helpers import (
+    build_page_url,
     extract_ad_id_from_url,
     normalize_price,
     normalize_url,
@@ -24,6 +25,7 @@ __all__ = [
     "NotifierError",
     "ParserError",
     "StorageError",
+    "build_page_url",
     "extract_ad_id_from_url",
     "normalize_price",
     "normalize_url",

@@ -49,8 +49,8 @@ class Scheduler:
                 logger.error("scheduler_cycle_error: %s", e, exc_info=True)
 
             if self._running:
-                logger.info("scheduler_sleeping_seconds=3000")
-                await asyncio.sleep(3000)
+                logger.info("scheduler_sleeping_seconds=300")
+                await asyncio.sleep(300)
 
         logger.info("scheduler_stopped")
 

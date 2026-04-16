@@ -114,10 +114,10 @@ def list_searches() -> None:
         searches = repo.get_active_searches()
 
         if not searches:
-            typer.echo("📭 Нет отслеживаемых поисков.")
+            typer.echo("[ ] Нет отслеживаемых поисков.")
             return
 
-        typer.echo(f"📋 Отслеживаемые поиски ({len(searches)}):\n")
+        typer.echo(f"[LIST] Отслеживаемые поиски ({len(searches)}):\n")
         typer.echo("-" * 100)
         typer.echo(
             f"{'ID':<5} {'Запрос':<25} {'Интервал':<10} "
@@ -152,17 +152,21 @@ def list_searches() -> None:
 
 @app.command("start")
 def start() -> None:
-    """Полный запуск: init-db + seed + scheduler."""
+    """Полный запуск: init-db + seed (модельные + категорийные) + scheduler."""
     # 1. Создать таблицы
     _ensure_tables()
     typer.echo("✅ Таблицы созданы/проверены")
 
-    # 2. Заполнить поиски
+    # 2. Заполнить модельные поиски
     _seed_searches()
-    typer.echo("✅ Поисковые запросы добавлены")
+    typer.echo("✅ Модельные поисковые запросы добавлены")
 
-    # 3. Запустить scheduler
-    typer.echo("🚀 Запуск планировщика...")
+    # 3. Заполнить категорийные поиски
+    _seed_category_searches()
+    typer.echo("✅ Категорийные поисковые запросы добавлены")
+
+    # 4. Запустить scheduler
+    typer.echo(">> Запуск планировщика...")
     asyncio.run(_run_scheduler())
 
 
@@ -179,9 +183,14 @@ def run_scheduler() -> None:
 
 
 @app.command("run-once")
-def run_once() -> None:
-    """Однократный запуск всех просроченных поисков."""
-    asyncio.run(_run_once())
+def run_once(
+    force: bool = typer.Option(
+        True, "--force/--no-force", help="Принудительно запустить ВСЕ поиски (по умолчанию). "
+        "С --no-force — только просроченные по расписанию.",
+    ),
+) -> None:
+    """Однократный запуск поисков. По умолчанию — все принудительно."""
+    asyncio.run(_run_once(force=force))
 
 
 # ------------------------------------------------------------------
@@ -248,9 +257,16 @@ async def _run_scheduler() -> None:
     await scheduler.run()
 
 
-async def _run_once() -> None:
-    """Асинхронная реализация однократного запуска просроченных поисков."""
+async def _run_once(force: bool = True) -> None:
+    """Асинхронная реализация однократного запуска поисков.
+
+    Args:
+        force: Если True (по умолчанию) — запустить ВСЕ активные поиски
+            принудительно. Если False — только просроченные по расписанию.
+    """
     from app.scheduler.pipeline import Pipeline
+    from app.storage import get_session
+    from app.storage.repository import Repository
     from app.utils import setup_logging
     from app.config import get_settings
 
@@ -258,12 +274,54 @@ async def _run_once() -> None:
     setup_logging(settings.LOG_LEVEL)
 
     logger = structlog.get_logger("cli")
-    logger.info("starting_run_once")
+    logger.info("starting_run_once", force=force)
+
+    if force:
+        typer.echo("[..] Запуск однократного цикла (run-once, принудительно — ВСЕ поиски)...")
+    else:
+        typer.echo("[..] Запуск однократного цикла (run-once, только просроченные)...")
+
+    # Получаем поиски в зависимости от флага force
+    forced_searches = None
+    if force:
+        from app.storage.database import ensure_tables
+        ensure_tables()
+
+        session = get_session()
+        repo = Repository(session)
+        try:
+            forced_searches = repo.get_active_searches()
+        finally:
+            repo.close()
+
+        if not forced_searches:
+            typer.echo("[INFO] Нет активных поисков для обработки.")
+            typer.echo("       Используйте 'add-search' для добавления поисков.")
+            return
+
+        typer.echo(f"[..] Найдено {len(forced_searches)} активных поисков. Запуск...")
 
     pipeline = Pipeline(settings)
-    stats = await pipeline.run_search_cycle()
+    stats = await pipeline.run_search_cycle(searches=forced_searches)
 
     logger.info("run_once_completed", **stats)
+
+    if stats["searches_processed"] == 0:
+        if force:
+            typer.echo("[INFO] Нет активных поисков для обработки.")
+        else:
+            typer.echo("[INFO] Нет просроченных поисков для обработки.")
+        typer.echo("       Используйте 'add-search' для добавления или подождите.")
+    else:
+        typer.echo(
+            f"[OK] Цикл завершён: "
+            f"поисков={stats['searches_processed']}, "
+            f"найдено={stats['ads_found']}, "
+            f"новых={stats['ads_new']}, "
+            f"недооценённых={stats['ads_undervalued']}, "
+            f"уведомлений={stats['notifications_sent']}, "
+            f"ошибок={stats['errors']}"
+        )
 
     if stats["errors"] > 0:
         raise typer.Exit(code=1)
@@ -346,11 +404,83 @@ def _seed_searches() -> None:
 
         repo.commit()
         typer.echo(
-            f"📊 Поисковые запросы: {added} добавлено, {updated} обновлено "
+            f"[STATS] Поисковые запросы: {added} добавлено, {updated} обновлено "
             f"(всего {len(SEARCHES)})"
         )
     except Exception as exc:
         typer.echo(f"❌ Ошибка при заполнении поисков: {exc}", err=True)
+        raise typer.Exit(code=1)
+    finally:
+        repo.close()
+
+
+def _seed_category_searches() -> None:
+    """Добавить категорийные поиски (телефоны, ноутбуки, велосипеды, шины)."""
+    from app.storage import get_session
+    from app.storage.repository import Repository
+
+    CATEGORY_SEARCHES = [
+        {
+            "search_url": "https://www.avito.ru/rossiya/telefony",
+            "search_phrase": "Телефоны (широкая лента)",
+            "category": "телефоны",
+            "schedule_interval_hours": 2,
+            "max_ads_to_parse": 20,
+            "priority": 10,
+        },
+        {
+            "search_url": "https://www.avito.ru/rossiya/noutbuki",
+            "search_phrase": "Ноутбуки (широкая лента)",
+            "category": "ноутбуки",
+            "schedule_interval_hours": 3,
+            "max_ads_to_parse": 15,
+            "priority": 8,
+        },
+        {
+            "search_url": "https://www.avito.ru/rossiya/velosipedy",
+            "search_phrase": "Велосипеды (широкая лента)",
+            "category": "велосипеды",
+            "schedule_interval_hours": 4,
+            "max_ads_to_parse": 20,
+            "priority": 7,
+        },
+        {
+            "search_url": "https://www.avito.ru/rossiya/shiny",
+            "search_phrase": "Шины (широкая лента)",
+            "category": "шины",
+            "schedule_interval_hours": 3,
+            "max_ads_to_parse": 20,
+            "priority": 7,
+        },
+    ]
+
+    session = get_session()
+    repo = Repository(session)
+    try:
+        created = 0
+        skipped = 0
+        for data in CATEGORY_SEARCHES:
+            existing = repo.get_or_create_tracked_search(data["search_url"])
+
+            if existing.search_phrase is None or getattr(existing, "search_type", None) == "model":
+                existing.search_type = "category"  # type: ignore[attr-defined]
+                existing.search_phrase = data["search_phrase"]
+                existing.category = data["category"]  # type: ignore[attr-defined]
+                existing.schedule_interval_hours = data["schedule_interval_hours"]
+                existing.max_ads_to_parse = data["max_ads_to_parse"]
+                existing.priority = data["priority"]
+                existing.is_active = True
+                created += 1
+            else:
+                skipped += 1
+
+        repo.commit()
+        typer.echo(
+            f"[STATS] Категорийные поиски: {created} создано, {skipped} пропущено "
+            f"(всего {len(CATEGORY_SEARCHES)})"
+        )
+    except Exception as exc:
+        typer.echo(f"❌ Ошибка при заполнении категорийных поисков: {exc}", err=True)
         raise typer.Exit(code=1)
     finally:
         repo.close()

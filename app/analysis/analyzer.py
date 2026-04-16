@@ -192,7 +192,7 @@ class PriceAnalyzer:
         Returns:
             Список объявлений за последние ``days`` дней.
         """
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
         filtered: list[Ad] = []
 
         for ad in ads:
@@ -200,19 +200,18 @@ class PriceAnalyzer:
             pub = ad.publication_date
             first_seen = ad.first_seen_at
 
-            # Приводим naive datetime к UTC-сравнению
+            # Приводим naive datetime (старые данные из БД) к offset-aware UTC
             is_recent = False
             if pub is not None:
-                # Если pub содержит tzinfo — приводим к UTC
-                if pub.tzinfo is not None:
-                    pub = pub.replace(tzinfo=None) - pub.utcoffset()  # type: ignore[operator]
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=datetime.timezone.utc)
 
                 if pub >= cutoff:
                     is_recent = True
 
             if not is_recent and first_seen is not None:
-                if first_seen.tzinfo is not None:
-                    first_seen = first_seen.replace(tzinfo=None) - first_seen.utcoffset()  # type: ignore[operator]
+                if first_seen.tzinfo is None:
+                    first_seen = first_seen.replace(tzinfo=datetime.timezone.utc)
 
                 if first_seen >= cutoff:
                     is_recent = True

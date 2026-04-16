@@ -14,10 +14,12 @@ from app.collector import BrowserManager, AvitoCollector
 from app.parser import parse_search_page, parse_ad_page, SearchResultItem, AdData
 from app.storage import Repository, get_session
 from app.storage.models import TrackedSearch
-from app.analysis import PriceAnalyzer, UndervaluedAd, AdAnalysisResult
+from app.analysis import PriceAnalyzer, UndervaluedAd, AdAnalysisResult, MarketStats
 from app.analysis.accessory_filter import AccessoryFilter
+from app.analysis.segment_analyzer import SegmentAnalyzer, DiamondAlert, CategorySegmentKey
+from app.analysis.attribute_extractor import AttributeExtractor
 from app.notifier import EmailNotifier, TelegramNotifier
-from app.utils import random_delay, setup_logging, extract_ad_id_from_url, normalize_url
+from app.utils import random_delay, setup_logging, extract_ad_id_from_url, normalize_url, build_page_url
 
 
 class Pipeline:
@@ -161,12 +163,16 @@ class Pipeline:
         self.logger.info("pipeline_completed", **self.stats)
         return self.stats
 
-    async def run_search_cycle(self) -> dict[str, int]:
+    async def run_search_cycle(
+        self,
+        searches: list[TrackedSearch] | None = None,
+    ) -> dict[str, int]:
         """Основной цикл обработки поисков из БД (масштабированный режим).
 
         Алгоритм:
             1. Получить поиски, которые пора запускать:
-               ``repo.get_searches_due_for_run()``.
+               ``repo.get_searches_due_for_run()`` — либо использовать
+               переданный список *searches* (принудительный запуск).
             2. Обрабатывать батчами по ``MAX_CONCURRENT_SEARCHES``
                с использованием ``asyncio.Semaphore``.
             3. Для каждого поиска: собрать страницу → парсить → взять
@@ -174,6 +180,11 @@ class Pipeline:
                проанализировать.
             4. После обработки каждого поиска обновлять ``last_run_at``.
             5. Задержки между поисками и между батчами.
+
+        Args:
+            searches: Если передан — использовать этот список поисков
+                (принудительный запуск). Иначе — получить просроченные
+                из БД через ``repo.get_searches_due_for_run()``.
 
         Returns:
             dict[str, int]: Статистика выполненного цикла.
@@ -192,8 +203,15 @@ class Pipeline:
         repo = Repository(session)
 
         try:
-            # Получаем поиски, которые пора запускать
-            due_searches = repo.get_searches_due_for_run()
+            # Получаем поиски: либо переданные принудительно, либо просроченные
+            if searches is not None:
+                due_searches = searches
+                self.logger.info(
+                    "forced_searches_provided",
+                    count=len(due_searches),
+                )
+            else:
+                due_searches = repo.get_searches_due_for_run()
 
             if not due_searches:
                 self.logger.info("no_searches_due_for_run")
@@ -353,14 +371,17 @@ class Pipeline:
         repo: Repository,
         max_ads: int | None = None,
     ) -> list[str]:
-        """Обработать один поисковый URL.
+        """Обработать один поисковый URL с пагинацией.
 
         Выполняет:
             1. Регистрацию поиска и запуск в БД.
-            2. Сбор и парсинг поисковой страницы.
+            2. Сбор и парсинг поисковых страниц (до MAX_SEARCH_PAGES_PER_RUN).
             3. Фильтрацию уже известных объявлений.
-            4. Обработку новых карточек (до лимита).
+            4. Обработку новых карточек (до лимита max_ads).
             5. Завершение записи запуска в БД.
+
+        Пагинация прекращается досрочно, если на странице не найдено
+        новых (ещё неизвестных) объявлений.
 
         Args:
             search_url: URL поисковой выдачи Avito.
@@ -382,93 +403,205 @@ class Pipeline:
         run_ads_new = 0
         run_ads_opened = 0
         run_errors = 0
+        pages_fetched = 0
         new_ad_ids: list[str] = []
+        all_search_items: list[SearchResultItem] = []
 
         try:
-            # Задержка перед сбором
-            await random_delay(
-                self.settings.MIN_DELAY_SECONDS,
-                self.settings.MAX_DELAY_SECONDS,
+            max_pages = self.settings.MAX_SEARCH_PAGES_PER_RUN
+
+            # Получаем список известных ad_id один раз для всех страниц
+            recent_ids = repo.get_recent_ad_ids(search_url)
+
+            # Счётчик ошибок через список (mutable для замыкания)
+            run_errors_counter = [0]
+
+            # Семфор для параллельного сбора карточек
+            ad_semaphore = asyncio.Semaphore(
+                self.settings.MAX_CONCURRENT_AD_PAGES,
             )
 
-            # Сбор поисковой страницы
-            html, _html_path = await collector.collect_search_page(search_url)
+            async def _process_ad_safe(
+                item: SearchResultItem,
+            ) -> str | None:
+                """Обёртка для параллельной обработки с семафором."""
+                async with ad_semaphore:
+                    try:
+                        return await self._process_ad(
+                            item, search_url, collector, repo,
+                        )
+                    except Exception as exc:
+                        run_errors_counter[0] += 1
+                        self.stats["errors"] += 1
+                        self.logger.error(
+                            "ad_processing_failed",
+                            url=item.url,
+                            error=str(exc),
+                        )
+                        return None
 
-            # Парсинг
-            search_items: list[SearchResultItem] = parse_search_page(
-                html, search_url,
-            )
-            run_ads_found = len(search_items)
-            self.stats["ads_found"] += run_ads_found
+            # --- Цикл по страницам пагинации ---
+            all_new_items: list[SearchResultItem] = []
 
-            self.logger.info(
-                "search_page_parsed",
-                search_url=search_url,
-                items_found=len(search_items),
-            )
+            for page_num in range(1, max_pages + 1):
+                page_url = build_page_url(search_url, page_num)
 
-            # Ранняя фильтрация аксессуаров (до сбора карточек)
-            search_items, early_filtered = self._early_filter_search_items(search_items)
-            if early_filtered > 0:
-                self.stats["ads_filtered"] += early_filtered
-                self.logger.info(
-                    "search_items_early_filtered",
-                    search_url=search_url,
-                    filtered_count=early_filtered,
-                    remaining=len(search_items),
+                # Задержка перед сбором страницы
+                await random_delay(
+                    self.settings.MIN_DELAY_SECONDS,
+                    self.settings.MAX_DELAY_SECONDS,
                 )
 
-            # Фильтрация уже известных
-            recent_ids = repo.get_recent_ad_ids(search_url)
-            known_items: list[SearchResultItem] = []
-            for item in search_items:
-                ad_id = extract_ad_id_from_url(item.url)
-                if ad_id not in recent_ids:
-                    _, created = repo.get_or_create_ad(
-                        ad_id, normalize_url(item.url), search_url,
+                self.logger.info(
+                    "collecting_search_page",
+                    search_url=search_url,
+                    page=page_num,
+                    max_pages=max_pages,
+                    page_url=page_url,
+                )
+
+                try:
+                    html, _html_path = await collector.collect_search_page(
+                        page_url,
                     )
-                    if created:
-                        known_items.append(item)
+                except Exception as exc:
+                    self.logger.warning(
+                        "search_page_collection_failed",
+                        page=page_num,
+                        page_url=page_url,
+                        error=str(exc),
+                    )
+                    run_errors += 1
+                    self.stats["errors"] += 1
+                    # Прерываем пагинацию при ошибке загрузки
+                    break
+
+                pages_fetched += 1
+
+                # Парсинг
+                search_items: list[SearchResultItem] = parse_search_page(
+                    html, page_url,
+                )
+                run_ads_found += len(search_items)
+                self.stats["ads_found"] += len(search_items)
+
+                self.logger.info(
+                    "search_page_parsed",
+                    search_url=search_url,
+                    page=page_num,
+                    items_found=len(search_items),
+                )
+
+                # Если страница пустая — прекращаем пагинацию
+                if not search_items:
+                    self.logger.info(
+                        "search_page_empty_pagination_stop",
+                        search_url=search_url,
+                        page=page_num,
+                    )
+                    break
+
+                # Ранняя фильтрация аксессуаров
+                search_items, early_filtered = self._early_filter_search_items(
+                    search_items,
+                )
+                if early_filtered > 0:
+                    self.stats["ads_filtered"] += early_filtered
+
+                all_search_items.extend(search_items)
+
+                # Фильтрация уже известных
+                new_on_page: list[SearchResultItem] = []
+                for item in search_items:
+                    ad_id = extract_ad_id_from_url(item.url)
+                    if ad_id not in recent_ids:
+                        _, created = repo.get_or_create_ad(
+                            ad_id, normalize_url(item.url), search_url,
+                        )
+                        if created:
+                            new_on_page.append(item)
+                            recent_ids.add(ad_id)
+
+                self.logger.info(
+                    "search_page_new_items",
+                    search_url=search_url,
+                    page=page_num,
+                    total_on_page=len(search_items),
+                    new_on_page=len(new_on_page),
+                )
+
+                # Если новых нет — прекращаем пагинацию
+                if not new_on_page:
+                    self.logger.info(
+                        "no_new_ads_pagination_stop",
+                        search_url=search_url,
+                        page=page_num,
+                    )
+                    break
+
+                all_new_items.extend(new_on_page)
+
+                # Если уже набрали достаточно — прекращаем
+                if len(all_new_items) >= max_ads:
+                    break
 
             # Лимит новых объявлений
-            new_items = known_items[:max_ads]
+            new_items = all_new_items[:max_ads]
             run_ads_new = len(new_items)
             self.stats["ads_new"] += run_ads_new
 
             self.logger.info(
-                "new_ads_to_process",
+                "pagination_summary",
                 search_url=search_url,
+                pages_fetched=pages_fetched,
                 total_found=run_ads_found,
                 new_ads=run_ads_new,
             )
 
-            # Обработка каждой карточки
-            for item in new_items:
-                try:
-                    ad_id = await self._process_ad(
-                        item, search_url, collector, repo,
-                    )
-                    if ad_id is not None:
-                        new_ad_ids.append(ad_id)
+            # Параллельная обработка карточек с семафором
+            if new_items:
+                ad_results = await asyncio.gather(
+                    *[_process_ad_safe(item) for item in new_items],
+                    return_exceptions=True,
+                )
+
+                for result in ad_results:
+                    if isinstance(result, Exception):
+                        run_errors += 1
+                        self.stats["errors"] += 1
+                    elif result is not None:
+                        new_ad_ids.append(result)
                         run_ads_opened += 1
-                except Exception as exc:
-                    run_errors += 1
-                    self.stats["errors"] += 1
-                    self.logger.error(
-                        "ad_processing_failed",
-                        url=item.url,
-                        error=str(exc),
-                    )
+
+            run_errors += run_errors_counter[0]
 
             # Завершение запуска
             repo.complete_search_run(
                 search_run.id,
                 ads_found=run_ads_found,
                 ads_new=run_ads_new,
-                pages_fetched=1,
+                pages_fetched=pages_fetched,
                 ads_opened=run_ads_opened,
                 errors_count=run_errors,
             )
+
+            # --- Обнаружение исчезнувших объявлений ---
+            try:
+                disappeared_ids = self._detect_disappeared_ads(
+                    search_url, all_search_items, repo,
+                )
+                if disappeared_ids:
+                    self.logger.info(
+                        "ads_disappeared_detected",
+                        search_url=search_url,
+                        count=len(disappeared_ids),
+                    )
+            except Exception as disp_exc:
+                self.logger.warning(
+                    "disappeared_detection_failed",
+                    search_url=search_url,
+                    error=str(disp_exc),
+                )
 
         except Exception as exc:
             run_errors += 1
@@ -546,6 +679,31 @@ class Pipeline:
             ad_record, _ = repo.get_or_create_ad(
                 ad_id, normalized_url, search_url,
             )
+
+            # --- Трекинг оборачиваемости: обновить last_seen_at ---
+            try:
+                now = datetime.now(timezone.utc)
+                days_on_market = None
+                if (
+                    hasattr(ad_record, "first_seen_at")
+                    and ad_record.first_seen_at is not None
+                ):
+                    first_seen = ad_record.first_seen_at
+                    if first_seen.tzinfo is None:
+                        first_seen = first_seen.replace(tzinfo=timezone.utc)
+                    delta = now - first_seen
+                    days_on_market = delta.days
+                repo.update_ad_tracking_fields(
+                    ad_id=ad_record.id,
+                    last_seen_at=now,
+                    days_on_market=days_on_market,
+                )
+            except Exception as tracking_exc:
+                self.logger.warning(
+                    "ad_tracking_update_failed",
+                    ad_id=ad_id,
+                    error=str(tracking_exc),
+                )
             repo.create_snapshot(
                 ad_id=ad_record.id,
                 price=ad_data.price,
@@ -697,6 +855,37 @@ class Pipeline:
 
         for search in searches:
             try:
+                # --- Ветвление по типу поиска ---
+                if getattr(search, 'is_category_search', False):
+                    # Категорийный поиск — сегментный анализ
+                    try:
+                        diamonds = await self._analyze_category_search(
+                            search, repo,
+                        )
+                        for diamond in diamonds:
+                            undervalued_item = UndervaluedAd(
+                                ad=diamond.ad,
+                                market_stats=MarketStats(
+                                    search_url=search.search_url,
+                                    count=diamond.sample_size,
+                                    median_price=diamond.median_price,
+                                    mean_price=diamond.median_price,
+                                    q1_price=None,
+                                ),
+                                deviation_percent=-diamond.discount_percent,
+                                threshold_used=self.settings.UNDERVALUE_THRESHOLD,
+                            )
+                            all_undervalued.append(undervalued_item)
+                    except Exception as cat_exc:
+                        self.logger.error(
+                            "category_analysis_failed",
+                            search_id=search.id,
+                            search_url=search.search_url,
+                            error=str(cat_exc),
+                        )
+                    continue
+
+                # --- Стандартный путь: анализ конкретных моделей ---
                 ads = repo.get_ads_for_analysis(
                     search.search_url,
                     days=self.settings.TEMPORAL_WINDOW_DAYS,
@@ -812,6 +1001,300 @@ class Pipeline:
 
         # Отправка уведомлений
         await self._send_notifications(all_undervalued, repo)
+
+    # ------------------------------------------------------------------
+    # Трекинг оборачиваемости и сегментный анализ
+    # ------------------------------------------------------------------
+
+    def _detect_disappeared_ads(
+        self,
+        search_url: str,
+        current_items: list[SearchResultItem],
+        repo: Repository,
+    ) -> list[int]:
+        """Обнаружить объявления, отсутствующие в текущем сборе.
+
+        Сравнивает все известные объявления для ``search_url`` с текущими
+        собранными ``ad_id``.  Те, что не найдены в текущей выдаче и
+        ещё не помечены как исчезнувшие, отмечаются через
+        ``repo.mark_ads_disappeared()``.
+
+        Args:
+            search_url: URL поисковой выдачи.
+            current_items: Элементы, найденные в текущем сборе.
+            repo: Экземпляр репозитория.
+
+        Returns:
+            list[int]: Список внутренних ID (``Ad.id``) исчезнувших
+            объявлений.
+        """
+        current_ad_ids: set[str] = {
+            extract_ad_id_from_url(item.url)
+            for item in current_items
+            if item.url
+        }
+
+        # Получаем все объявления для данного поиска
+        all_ads = repo.get_ads_for_search(search_url)
+
+        disappeared_db_ids: list[int] = []
+        for ad in all_ads:
+            if ad.ad_id not in current_ad_ids:
+                # Проверяем, не помечено ли уже
+                if getattr(ad, "is_disappeared_quickly", False):
+                    continue
+                disappeared_db_ids.append(ad.id)
+
+        if disappeared_db_ids:
+            days_threshold = getattr(
+                self.settings, "segment_fast_sale_days", 3,
+            )
+            try:
+                repo.mark_ads_disappeared(
+                    disappeared_db_ids,
+                    days_threshold=days_threshold,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "mark_disappeared_failed",
+                    search_url=search_url,
+                    error=str(exc),
+                )
+
+        return disappeared_db_ids
+
+    async def _analyze_category_search(
+        self,
+        search: TrackedSearch,
+        repo: Repository,
+    ) -> list[DiamondAlert]:
+        """Анализ категорийного поиска с полным сегментным анализом.
+
+        Алгоритм:
+            1. Получить объявления за ``TEMPORAL_WINDOW_DAYS``.
+            2. Отфильтровать аксессуары.
+            3. Извлечь атрибуты для объявлений без них.
+            4. Сегментация через ``SegmentAnalyzer``.
+            5. Расчёт статистики с временными окнами и ликвидностью.
+            6. Сохранение snapshot в ``segment_price_history``.
+            7. Детекция «бриллиантов».
+            8. Обновление БД.
+
+        Args:
+            search: Отслеживаемый категорийный поиск.
+            repo: Экземпляр репозитория.
+
+        Returns:
+            list[DiamondAlert]: Найденные «бриллианты».
+        """
+        segment_analyzer = SegmentAnalyzer(settings=self.settings)
+        attribute_extractor = AttributeExtractor()
+
+        # 1. Получить объявления
+        ads = repo.get_ads_for_analysis(
+            search.search_url,
+            days=self.settings.TEMPORAL_WINDOW_DAYS,
+        )
+        if not ads:
+            self.logger.info(
+                "category_search_no_ads",
+                search_id=search.id,
+                search_url=search.search_url,
+            )
+            return []
+
+        # 2. Фильтрация аксессуаров
+        accessory_filter = AccessoryFilter(
+            blacklist=self.settings.ACCESSORY_BLACKLIST,
+            min_price=self.settings.MIN_PRICE_FILTER,
+            price_ratio=self.settings.ACCESSORY_PRICE_RATIO_THRESHOLD,
+            enabled=self.settings.ENABLE_ACCESSORY_FILTER,
+        )
+        filtered_ads = []
+        for ad in ads:
+            if ad.price is None or ad.price <= 0:
+                continue
+            filter_result = accessory_filter.is_accessory(ad, median_price=None)
+            if filter_result.is_filtered:
+                continue
+            filtered_ads.append(ad)
+
+        if not filtered_ads:
+            self.logger.info(
+                "category_search_all_filtered",
+                search_id=search.id,
+            )
+            return []
+
+        # 3. Извлечь атрибуты для объявлений без них
+        for ad in filtered_ads:
+            if not getattr(ad, "ad_category", None) and ad.title:
+                try:
+                    search_category = getattr(search, "category", None)
+                    attrs = attribute_extractor.extract(
+                        ad.title, search_category=search_category,
+                    )
+                    if attrs.category or attrs.brand or attrs.model:
+                        repo.update_ad_tracking_fields(
+                            ad_id=ad.id,
+                            ad_category=attrs.category,
+                            brand=attrs.brand,
+                            extracted_model=attrs.model,
+                        )
+                except Exception as attr_exc:
+                    self.logger.warning(
+                        "attribute_extraction_failed",
+                        ad_id=ad.ad_id,
+                        error=str(attr_exc),
+                    )
+
+        # 4-6. Сегментация и расчёт статистики
+        segment_results = segment_analyzer.analyze_segments(
+            ads=filtered_ads,
+            repo=repo,
+            search_id=search.id,
+        )
+
+        self.logger.info(
+            "category_search_segments_analyzed",
+            search_id=search.id,
+            total_ads=len(filtered_ads),
+            segments=len(segment_results),
+        )
+
+        # 7. Детекция «бриллиантов»
+        diamonds: list[DiamondAlert] = []
+        for segment_key_str, stats_dict in segment_results.items():
+            best_median, reason = segment_analyzer.get_best_median(stats_dict)
+            if best_median <= 0:
+                continue
+
+            # Ищем «бриллианты» среди объявлений этого сегмента
+            for ad in filtered_ads:
+                if ad.price is None or ad.price <= 0:
+                    continue
+                diamond = self._check_diamond_candidate(
+                    ad, stats_dict, best_median, reason,
+                )
+                if diamond is not None:
+                    diamonds.append(diamond)
+
+        self.logger.info(
+            "category_search_diamonds_detected",
+            search_id=search.id,
+            diamonds_count=len(diamonds),
+        )
+
+        return diamonds
+
+    def _check_diamond_candidate(
+        self,
+        ad: "Ad",
+        segment_stats: dict,
+        best_median: float,
+        median_reason: str,
+    ) -> DiamondAlert | None:
+        """Проверяет, является ли объявление «бриллиантом».
+
+        Условия:
+            - Сегмент редкий (``is_rare_segment = True``) **или**
+              цена < ``listing_price_median * 0.7`` (на 30% ниже медианы).
+            - И/или цена < ``fast_sale_price_median * 0.8``.
+            - И/или исторически быстрые продажи были сильно выше текущего
+              листинга.
+
+        Args:
+            ad: Объявление для проверки.
+            segment_stats: Словарь статистики сегмента.
+            best_median: Лучшая медиана сегмента.
+            median_reason: Описание причины выбора медианы.
+
+        Returns:
+            DiamondAlert | None: Алерт если «бриллиант», иначе ``None``.
+        """
+        if ad.price is None or ad.price <= 0 or best_median <= 0:
+            return None
+
+        listing_price_median = segment_stats.get("listing_price_median")
+        fast_sale_price_median = segment_stats.get("fast_sale_price_median")
+        is_rare = segment_stats.get("is_rare_segment", False)
+        sample_size = segment_stats.get("sample_size", 0)
+
+        # Пороговые коэффициенты
+        discount_threshold = 0.7   # 30% ниже медианы
+        fast_sale_threshold = 0.8  # 20% ниже медианы быстрой продажи
+
+        reasons: list[str] = []
+        is_diamond = False
+
+        # Проверка: цена значительно ниже медианы листинга
+        if (
+            listing_price_median is not None
+            and listing_price_median > 0
+            and ad.price < listing_price_median * discount_threshold
+        ):
+            is_diamond = True
+            reasons.append(
+                f"цена {ad.price:,.0f}₽ < listing_median "
+                f"{listing_price_median:,.0f}₽ × {discount_threshold}"
+            )
+
+        # Проверка: цена ниже медианы быстрых продаж
+        if (
+            fast_sale_price_median is not None
+            and fast_sale_price_median > 0
+            and ad.price < fast_sale_price_median * fast_sale_threshold
+        ):
+            is_diamond = True
+            reasons.append(
+                f"цена {ad.price:,.0f}₽ < fast_sale_median "
+                f"{fast_sale_price_median:,.0f}₽ × {fast_sale_threshold}"
+            )
+
+        # Редкий сегмент — дополнительный бонус
+        if is_rare and ad.price < best_median * 0.85:
+            is_diamond = True
+            reasons.append(
+                f"редкий сегмент + цена {ad.price:,.0f}₽ < "
+                f"best_median {best_median:,.0f}₽ × 0.85"
+            )
+
+        if not is_diamond:
+            return None
+
+        discount_percent = (
+            (best_median - ad.price) / best_median * 100
+        )
+
+        # Сегментный ключ
+        segment_key = CategorySegmentKey(
+            category=getattr(ad, "ad_category", "unknown") or "unknown",
+            brand=getattr(ad, "brand", "unknown") or "unknown",
+            model=getattr(ad, "extracted_model", "unknown") or "unknown",
+            condition=getattr(ad, "condition", "unknown") or "unknown",
+            location=getattr(ad, "location", "unknown") or "unknown",
+        )
+
+        self.logger.info(
+            "diamond_detected",
+            ad_id=ad.ad_id,
+            price=ad.price,
+            best_median=best_median,
+            discount_percent=round(discount_percent, 1),
+            reason="; ".join(reasons),
+        )
+
+        return DiamondAlert(
+            ad=ad,
+            segment_key=segment_key,
+            segment_stats=None,
+            price=ad.price,
+            median_price=best_median,
+            discount_percent=discount_percent,
+            sample_size=sample_size,
+            reason="; ".join(reasons),
+            is_rare_segment=is_rare,
+        )
 
     def _early_filter_search_items(
         self,

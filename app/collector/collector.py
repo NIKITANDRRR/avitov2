@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 
 import structlog
 
@@ -29,13 +29,15 @@ class AvitoCollector:
     # Селекторы ожидания для поисковой страницы
     _SEARCH_SELECTORS: list[str] = [
         '[data-marker="item"]',
-        "div.items-items-kAJAg",
+        "div[class*='items-items-']",
     ]
 
     # Селекторы ожидания для карточки объявления
     _AD_SELECTORS: list[str] = [
+        '[data-marker="item-view/title-info"]',
         '[data-marker="item-view/item-title"]',
-        "h1.title-root",
+        'h1[itemprop="name"]',
+        "h1",
     ]
 
     def __init__(self, browser_manager: BrowserManager, settings: Settings) -> None:
@@ -87,7 +89,7 @@ class AvitoCollector:
             html = await page.content()
 
             # Генерация имени файла
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"search_{timestamp}"
             directory = f"{self.settings.RAW_HTML_PATH}/search"
             saved_path = save_html(html, directory, filename)
@@ -115,7 +117,7 @@ class AvitoCollector:
             # Пытаемся сохранить HTML для отладки даже при ошибке
             try:
                 html = await page.content()
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 directory = f"{self.settings.RAW_HTML_PATH}/search"
                 save_html(html, directory, f"search_error_{timestamp}")
             except Exception:
@@ -174,7 +176,7 @@ class AvitoCollector:
             html = await page.content()
 
             # Генерация имени файла
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"ad_{timestamp}"
             directory = f"{self.settings.RAW_HTML_PATH}/ad"
             saved_path = save_html(html, directory, filename)
@@ -202,7 +204,7 @@ class AvitoCollector:
             # Пытаемся сохранить HTML для отладки даже при ошибке
             try:
                 html = await page.content()
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 directory = f"{self.settings.RAW_HTML_PATH}/ad"
                 save_html(html, directory, f"ad_error_{timestamp}")
             except Exception:

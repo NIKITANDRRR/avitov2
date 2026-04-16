@@ -6,9 +6,11 @@ import datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -20,8 +22,8 @@ from app.storage.database import Base
 
 
 def _utcnow() -> datetime.datetime:
-    """Возвращает текущее UTC-время."""
-    return datetime.datetime.utcnow()
+    """Возвращает текущее UTC-время (timezone-aware)."""
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,8 @@ class TrackedSearch(Base):
         max_ads_to_parse: Сколько карточек парсить за один запуск.
         created_at: Дата-время создания записи.
         updated_at: Дата-время последнего обновления записи.
+        category: Категория поиска (для категорийного мониторинга).
+        is_category_search: Флаг категорийного поиска.
         runs: Связанные запуски поиска (one-to-many).
     """
 
@@ -57,18 +61,20 @@ class TrackedSearch(Base):
         Integer, default=2, nullable=False,
     )
     last_run_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime, nullable=True,
+        DateTime(timezone=True), nullable=True,
     )
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_ads_to_parse: Mapped[int] = mapped_column(
         Integer, default=3, nullable=False,
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=_utcnow,
+        DateTime(timezone=True), default=_utcnow,
     )
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=_utcnow, onupdate=_utcnow,
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
     )
+    category: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_category_search: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Relationships
     runs: Mapped[list[SearchRun]] = relationship(
@@ -115,9 +121,9 @@ class SearchRun(Base):
         ForeignKey("tracked_searches.id", ondelete="CASCADE"),
         nullable=False,
     )
-    started_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    started_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime, nullable=True,
+        DateTime(timezone=True), nullable=True,
     )
     status: Mapped[str] = mapped_column(String(20), default="running")
     ads_found: Mapped[int] = mapped_column(Integer, default=0)
@@ -167,6 +173,12 @@ class Ad(Base):
         segment_key: Ключ сегмента вида «{condition}_{location}_{seller_type}».
         parse_status: Статус парсинга (pending/parsed/failed).
         last_error: Текст последней ошибки парсинга.
+        last_seen_at: Когда объявление последний раз замечено.
+        days_on_market: Количество дней на рынке.
+        is_disappeared_quickly: Быстро ли исчезло.
+        ad_category: Категория объявления.
+        brand: Бренд товара.
+        extracted_model: Извлечённая модель товара.
         snapshots: Связанные снимки цен (one-to-many).
         notifications: Связанные отправленные уведомления (one-to-many).
     """
@@ -187,16 +199,16 @@ class Ad(Base):
     seller_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     condition: Mapped[str | None] = mapped_column(String(128), nullable=True)
     publication_date: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime, nullable=True,
+        DateTime(timezone=True), nullable=True,
     )
     search_url: Mapped[str | None] = mapped_column(
         String(2048), nullable=True, index=True,
     )
     first_seen_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=_utcnow,
+        DateTime(timezone=True), default=_utcnow,
     )
     last_scraped_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=_utcnow,
+        DateTime(timezone=True), default=_utcnow,
     )
     is_undervalued: Mapped[bool] = mapped_column(Boolean, default=False)
     undervalue_score: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -205,6 +217,14 @@ class Ad(Base):
     segment_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     parse_status: Mapped[str] = mapped_column(String(20), default="pending")
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_seen_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    days_on_market: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_disappeared_quickly: Mapped[bool] = mapped_column(Boolean, default=False)
+    ad_category: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    brand: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    extracted_model: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Relationships
     snapshots: Mapped[list[AdSnapshot]] = relationship(
@@ -253,7 +273,7 @@ class AdSnapshot(Base):
     )
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     scraped_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=_utcnow,
+        DateTime(timezone=True), default=_utcnow,
     )
     html_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
@@ -298,7 +318,7 @@ class NotificationSent(Base):
         String(50), default="telegram_undervalued",
     )
     sent_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=_utcnow,
+        DateTime(timezone=True), default=_utcnow,
     )
     telegram_message_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True,
@@ -311,4 +331,173 @@ class NotificationSent(Base):
         return (
             f"<NotificationSent id={self.id} ad_id={self.ad_id} "
             f"type={self.notification_type!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SegmentStats — статистика сегмента
+# ---------------------------------------------------------------------------
+
+class SegmentStats(Base):
+    """Статистика ценового сегмента для отслеживаемого поиска.
+
+    Attributes:
+        id: Первичный ключ.
+        search_id: FK на TrackedSearch.
+        segment_key: Ключ сегмента (например «brand:model» или «category:subcategory»).
+        segment_name: Человекочитаемое название сегмента.
+        median_7d: Медианная цена за 7 дней.
+        median_30d: Медианная цена за 30 дней (основная метрика).
+        median_90d: Медианная цена за 90 дней.
+        mean_price: Средняя цена.
+        min_price: Минимальная цена.
+        max_price: Максимальная цена.
+        price_trend_slope: Наклон тренда цены.
+        sample_size: Размер выборки.
+        listing_count: Количество активных объявлений.
+        appearance_count_90d: Сколько раз товар появлялся за 90 дней.
+        median_days_on_market: Медиана дней на рынке.
+        listing_price_median: Медиана по активным объявлениям.
+        fast_sale_price_median: Медиана цен быстрых продаж.
+        liquid_market_estimate: Оценка ликвидной цены.
+        is_rare_segment: Признак редкого сегмента.
+        calculated_at: Дата-время расчёта.
+        updated_at: Дата-время последнего обновления.
+        search: Связанный объект TrackedSearch.
+    """
+
+    __tablename__ = "segment_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    search_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("tracked_searches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_key: Mapped[str] = mapped_column(String, nullable=False)
+    segment_name: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Ценовые метрики
+    median_7d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    median_30d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    median_90d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mean_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    min_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Тренд
+    price_trend_slope: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Объём
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    listing_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Оборачиваемость
+    appearance_count_90d: Mapped[int] = mapped_column(Integer, default=0)
+    median_days_on_market: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Двухуровневая цена
+    listing_price_median: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fast_sale_price_median: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquid_market_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Редкость
+    is_rare_segment: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Метаданные
+    calculated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
+    )
+
+    # Связь
+    search: Mapped[TrackedSearch] = relationship(
+        "TrackedSearch", backref="segment_stats",
+    )
+
+    # Уникальный индекс
+    __table_args__ = (
+        UniqueConstraint("search_id", "segment_key", name="uq_segment_stats_search_key"),
+        Index("ix_segment_stats_search_id", "search_id"),
+        Index("ix_segment_stats_segment_key", "segment_key"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SegmentStats id={self.id} search_id={self.search_id} "
+            f"segment_key={self.segment_key!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SegmentPriceHistory — история цен сегмента
+# ---------------------------------------------------------------------------
+
+class SegmentPriceHistory(Base):
+    """История цен сегмента по дням.
+
+    Attributes:
+        id: Первичный ключ.
+        segment_stats_id: FK на SegmentStats.
+        snapshot_date: Дата снапшота.
+        median_price: Медианная цена на дату.
+        mean_price: Средняя цена на дату.
+        min_price: Минимальная цена на дату.
+        max_price: Максимальная цена на дату.
+        sample_size: Размер выборки на дату.
+        listing_count: Количество объявлений на дату.
+        fast_sale_count: Количество быстрых продаж на дату.
+        median_days_on_market: Медиана дней на рынке на дату.
+        created_at: Дата-время создания записи.
+        segment_stats: Связанный объект SegmentStats.
+    """
+
+    __tablename__ = "segment_price_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    segment_stats_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("segment_stats.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    snapshot_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+
+    # Цены на дату
+    median_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mean_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    min_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Оборачиваемость на дату
+    listing_count: Mapped[int] = mapped_column(Integer, default=0)
+    fast_sale_count: Mapped[int] = mapped_column(Integer, default=0)
+    median_days_on_market: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Метаданные
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+
+    # Связь
+    segment_stats: Mapped[SegmentStats] = relationship(
+        "SegmentStats", backref="price_history",
+    )
+
+    # Уникальный индекс — один снапшот в день на сегмент
+    __table_args__ = (
+        UniqueConstraint(
+            "segment_stats_id", "snapshot_date",
+            name="uq_segment_price_history_stats_date",
+        ),
+        Index("ix_segment_price_history_snapshot_date", "snapshot_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SegmentPriceHistory id={self.id} "
+            f"segment_stats_id={self.segment_stats_id} "
+            f"date={self.snapshot_date}>"
         )

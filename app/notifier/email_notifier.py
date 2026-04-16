@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
@@ -94,7 +94,7 @@ class EmailNotifier:
         )
         url = getattr(ad, "url", None) or "Не указано"
         location = getattr(ad, "location", None) or "Не указано"
-        detected_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        detected_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         return (
             "🔔 Товар ниже рынка!\n"

@@ -8,6 +8,8 @@ from app.storage.models import (
     AdSnapshot,
     NotificationSent,
     SearchRun,
+    SegmentPriceHistory,
+    SegmentStats,
     TrackedSearch,
 )
 from app.storage.repository import Repository
@@ -21,6 +23,8 @@ __all__ = [
     "AdSnapshot",
     "NotificationSent",
     "SearchRun",
+    "SegmentPriceHistory",
+    "SegmentStats",
     "TrackedSearch",
     "Repository",
 ]

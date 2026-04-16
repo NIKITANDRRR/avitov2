@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     )
 
     # Collection limits
-    MAX_SEARCH_PAGES_PER_RUN: int = Field(default=3, ge=1, le=10)
+    MAX_SEARCH_PAGES_PER_RUN: int = Field(default=50, ge=1, le=100)
     MAX_ADS_PER_SEARCH_PER_RUN: int = Field(default=3, ge=1, le=10)
 
     # Delays (seconds)
@@ -194,6 +194,12 @@ class Settings(BaseSettings):
         le=20,
         description="Макс. параллельных поисков в батче",
     )
+    MAX_CONCURRENT_AD_PAGES: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Макс. параллельно открываемых карточек объявлений",
+    )
     DEFAULT_SCHEDULE_INTERVAL_HOURS: int = Field(
         default=2,
         ge=1,
@@ -215,6 +221,40 @@ class Settings(BaseSettings):
         default=5,
         ge=0,
         description="Задержка между поисками в батче (сек)",
+    )
+
+    # --- Segment Analysis Settings ---
+    segment_rare_threshold: int = Field(
+        default=5,
+        description="Минимальное кол-во объявлений, чтобы сегмент не считался редким",
+    )
+    segment_fast_sale_days: int = Field(
+        default=3,
+        description="Кол-во дней, за которое продажа считается быстрой",
+    )
+    segment_7d_weight: float = Field(
+        default=1.5,
+        description="Вес 7d медианы при росте рынка",
+    )
+    segment_trend_window_days: int = Field(
+        default=30,
+        description="Окно для расчёта тренда цены",
+    )
+    segment_history_snapshot_days: int = Field(
+        default=7,
+        description="Периодичность сохранения снапшотов (дни)",
+    )
+    segment_min_samples_for_stats: int = Field(
+        default=3,
+        description="Минимум объявлений для расчёта статистики",
+    )
+    segment_liquidity_premium: float = Field(
+        default=1.2,
+        description="Премия за ликвидность для редких товаров",
+    )
+    segment_price_outlier_percentile: float = Field(
+        default=0.05,
+        description="Процентиль для отсечения выбросов",
     )
 
     # Storage

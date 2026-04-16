@@ -74,8 +74,9 @@ def parse_ad_page(html: str, url: str) -> AdData:
 
         # --- title ---
         title = _safe_extract(soup, "title", [
+            '[data-marker="item-view/title-info"]',
             '[data-marker="item-view/item-title"]',
-            "h1.title-root",
+            'h1[itemprop="name"]',
             "h1",
         ])
 
@@ -272,7 +273,7 @@ def normalize_publication_date(raw: str | None) -> datetime.datetime | None:
 
     # Очистка от ведущих символов ·, —, пробелов
     cleaned = raw.strip().lstrip("·— ").strip()
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc)
 
     # --- сегодня в HH:MM ---
     m = re.match(r"сегодня\s+в\s+(\d{1,2}):(\d{2})", cleaned)

@@ -155,6 +155,33 @@ def setup_logging(level: str) -> None:
     )
 
 
+def build_page_url(base_url: str, page: int) -> str:
+    """Добавить или обновить параметр пагинации ``p`` в URL Avito.
+
+    Для страницы 1 возвращает исходный URL без параметра ``p``.
+    Для последующих — добавляет ``&p=N`` (или обновляет, если уже есть).
+
+    Args:
+        base_url: Базовый URL поисковой выдачи Avito.
+        page: Номер страницы (начиная с 1).
+
+    Returns:
+        str: URL с параметром пагинации.
+    """
+    if page <= 1:
+        return base_url
+
+    # Удаляем существующий параметр p если есть
+    parts = base_url.split("?")
+    path = parts[0]
+    query = parts[1] if len(parts) > 1 else ""
+
+    params = [p for p in query.split("&") if p and not p.startswith("p=")]
+    params.append(f"p={page}")
+
+    return f"{path}?{'&'.join(params)}"
+
+
 def build_avito_url(query: str, location: str = "Москва") -> str:
     """Построить URL поиска Avito по запросу и локации.
 

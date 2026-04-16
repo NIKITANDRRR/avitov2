@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -140,7 +140,7 @@ class TelegramNotifier:
         )
         url = getattr(ad, "url", None) or "Не указано"
         location = getattr(ad, "location", None) or "Не указано"
-        detected_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        detected_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         return (
             "🔔 <b>Товар ниже рынка!</b>\n"

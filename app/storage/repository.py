@@ -6,7 +6,7 @@ import datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 import structlog
 
@@ -17,6 +17,8 @@ from app.storage.models import (
     NotificationSent,
     SearchRun,
     TrackedSearch,
+    SegmentStats,
+    SegmentPriceHistory,
 )
 
 logger = structlog.get_logger(__name__)
@@ -120,7 +122,7 @@ class Repository:
         try:
             run = SearchRun(
                 tracked_search_id=tracked_search_id,
-                started_at=datetime.datetime.utcnow(),
+                started_at=datetime.datetime.now(datetime.timezone.utc),
                 status="running",
             )
             self.session.add(run)
@@ -159,7 +161,7 @@ class Repository:
                 return
 
             run.status = "completed"
-            run.completed_at = datetime.datetime.utcnow()
+            run.completed_at = datetime.datetime.now(datetime.timezone.utc)
             for key, value in kwargs.items():
                 if hasattr(run, key):
                     setattr(run, key, value)
@@ -193,7 +195,7 @@ class Repository:
                 return
 
             run.status = "failed"
-            run.completed_at = datetime.datetime.utcnow()
+            run.completed_at = datetime.datetime.now(datetime.timezone.utc)
             run.error_message = error
             run.errors_count = (run.errors_count or 0) + 1
 
@@ -331,7 +333,7 @@ class Repository:
             for key, value in kwargs.items():
                 if hasattr(ad, key):
                     setattr(ad, key, value)
-            ad.last_scraped_at = datetime.datetime.utcnow()
+            ad.last_scraped_at = datetime.datetime.now(datetime.timezone.utc)
 
             self.session.flush()
             logger.debug("ad_updated", ad_id=ad_id, fields=list(kwargs.keys()))
@@ -386,7 +388,7 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
             stmt = (
                 select(Ad.ad_id)
                 .where(Ad.search_url == search_url)
@@ -614,7 +616,7 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
             stmt = (
                 select(Ad)
                 .where(Ad.segment_key == segment_key)
@@ -657,7 +659,7 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
             stmt = (
                 select(Ad)
                 .where(Ad.search_url == search_url)
@@ -703,7 +705,7 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
-            now = datetime.datetime.utcnow()
+            now = datetime.datetime.now(datetime.timezone.utc)
             stmt = (
                 select(TrackedSearch)
                 .where(TrackedSearch.is_active.is_(True))
@@ -716,10 +718,15 @@ class Repository:
                 if search.last_run_at is None:
                     due.append(search)
                 else:
+                    last_run = search.last_run_at
+                    if last_run.tzinfo is None:
+                        last_run = last_run.replace(
+                            tzinfo=datetime.timezone.utc,
+                        )
                     interval = datetime.timedelta(
                         hours=search.schedule_interval_hours,
                     )
-                    if now >= search.last_run_at + interval:
+                    if now >= last_run + interval:
                         due.append(search)
 
             logger.debug(
@@ -754,7 +761,7 @@ class Repository:
                 )
                 return
 
-            tracked.last_run_at = datetime.datetime.utcnow()
+            tracked.last_run_at = datetime.datetime.now(datetime.timezone.utc)
             self.session.flush()
             logger.info(
                 "search_last_run_updated",
@@ -816,6 +823,671 @@ class Repository:
             )
             raise StorageError(
                 f"Failed to update ad analysis: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # SegmentStats / SegmentPriceHistory
+    # ------------------------------------------------------------------
+
+    def upsert_segment_stats(
+        self, search_id: int, segment_key: str, stats: dict,
+    ) -> SegmentStats:
+        """Создаёт или обновляет запись статистики сегмента.
+
+        Ищет существующую запись по ``search_id`` + ``segment_key``.
+        Если найдена — обновляет переданные поля из ``stats``.
+        Если нет — создаёт новую запись.
+
+        Args:
+            search_id: ID отслеживаемого поиска (TrackedSearch.id).
+            segment_key: Ключ сегмента.
+            stats: Словарь с полями: ``median_7d``, ``median_30d``,
+                ``median_90d``, ``mean_price``, ``min_price``, ``max_price``,
+                ``price_trend_slope``, ``sample_size``, ``listing_count``,
+                ``appearance_count_90d``, ``median_days_on_market``,
+                ``listing_price_median``, ``fast_sale_price_median``,
+                ``liquid_market_estimate``, ``is_rare_segment``,
+                ``segment_name``.
+
+        Returns:
+            SegmentStats: Привязанный к сессии объект.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = (
+                select(SegmentStats)
+                .where(SegmentStats.search_id == search_id)
+                .where(SegmentStats.segment_key == segment_key)
+            )
+            existing = self.session.execute(stmt).scalar_one_or_none()
+
+            if existing is not None:
+                for key, value in stats.items():
+                    if hasattr(existing, key):
+                        setattr(existing, key, value)
+                existing.calculated_at = datetime.datetime.now(datetime.timezone.utc)
+                existing.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                self.session.flush()
+                logger.debug(
+                    "segment_stats_updated",
+                    search_id=search_id,
+                    segment_key=segment_key,
+                )
+                return existing
+
+            new_stats = SegmentStats(
+                search_id=search_id,
+                segment_key=segment_key,
+                **{k: v for k, v in stats.items() if hasattr(SegmentStats, k)},
+            )
+            self.session.add(new_stats)
+            self.session.flush()
+            logger.info(
+                "segment_stats_created",
+                search_id=search_id,
+                segment_key=segment_key,
+                stats_id=new_stats.id,
+            )
+            return new_stats
+        except SQLAlchemyError as exc:
+            logger.error(
+                "upsert_segment_stats_failed",
+                search_id=search_id,
+                segment_key=segment_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to upsert segment stats: {exc}"
+            ) from exc
+
+    def get_segment_stats(
+        self,
+        search_id: int,
+        segment_key: str | None = None,
+    ) -> list[SegmentStats] | SegmentStats | None:
+        """Возвращает статистику сегмента(ов) для поиска.
+
+        Если ``segment_key`` задан — возвращает одну запись или ``None``.
+        Если нет — возвращает все записи для ``search_id``.
+
+        Args:
+            search_id: ID отслеживаемого поиска (TrackedSearch.id).
+            segment_key: Ключ сегмента (опционально).
+
+        Returns:
+            list[SegmentStats] | SegmentStats | None: Статистика сегмента(ов).
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            if segment_key is not None:
+                stmt = (
+                    select(SegmentStats)
+                    .where(SegmentStats.search_id == search_id)
+                    .where(SegmentStats.segment_key == segment_key)
+                )
+                result = self.session.execute(stmt).scalar_one_or_none()
+                logger.debug(
+                    "segment_stats_fetched",
+                    search_id=search_id,
+                    segment_key=segment_key,
+                    found=result is not None,
+                )
+                return result
+
+            stmt = select(SegmentStats).where(
+                SegmentStats.search_id == search_id,
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "segment_stats_list_fetched",
+                search_id=search_id,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_segment_stats_failed",
+                search_id=search_id,
+                segment_key=segment_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get segment stats: {exc}"
+            ) from exc
+
+    def save_price_history_snapshot(
+        self,
+        segment_stats_id: int,
+        snapshot_date: datetime.date,
+        data: dict,
+    ) -> SegmentPriceHistory:
+        """Создаёт или обновляет снапшот истории цен для сегмента.
+
+        Использует UPSERT по ``(segment_stats_id, snapshot_date)``.
+
+        Args:
+            segment_stats_id: ID записи SegmentStats.
+            snapshot_date: Дата снапшота.
+            data: Словарь с полями: ``median_price``, ``mean_price``,
+                ``min_price``, ``max_price``, ``sample_size``,
+                ``listing_count``, ``fast_sale_count``,
+                ``median_days_on_market``.
+
+        Returns:
+            SegmentPriceHistory: Привязанный к сессии объект.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = (
+                select(SegmentPriceHistory)
+                .where(SegmentPriceHistory.segment_stats_id == segment_stats_id)
+                .where(SegmentPriceHistory.snapshot_date == snapshot_date)
+            )
+            existing = self.session.execute(stmt).scalar_one_or_none()
+
+            if existing is not None:
+                for key, value in data.items():
+                    if hasattr(existing, key):
+                        setattr(existing, key, value)
+                self.session.flush()
+                logger.debug(
+                    "price_history_snapshot_updated",
+                    segment_stats_id=segment_stats_id,
+                    snapshot_date=str(snapshot_date),
+                )
+                return existing
+
+            snapshot = SegmentPriceHistory(
+                segment_stats_id=segment_stats_id,
+                snapshot_date=snapshot_date,
+                **{k: v for k, v in data.items() if hasattr(SegmentPriceHistory, k)},
+            )
+            self.session.add(snapshot)
+            self.session.flush()
+            logger.info(
+                "price_history_snapshot_created",
+                segment_stats_id=segment_stats_id,
+                snapshot_date=str(snapshot_date),
+                snapshot_id=snapshot.id,
+            )
+            return snapshot
+        except SQLAlchemyError as exc:
+            logger.error(
+                "save_price_history_snapshot_failed",
+                segment_stats_id=segment_stats_id,
+                snapshot_date=str(snapshot_date),
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to save price history snapshot: {exc}"
+            ) from exc
+
+    def get_price_history(
+        self,
+        segment_stats_id: int,
+        days: int = 90,
+    ) -> list[SegmentPriceHistory]:
+        """Возвращает историю цен сегмента за последние ``days`` дней.
+
+        Сортировка по ``snapshot_date`` ASC.
+
+        Args:
+            segment_stats_id: ID записи SegmentStats.
+            days: Количество дней истории.
+
+        Returns:
+            list[SegmentPriceHistory]: Записи истории цен.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            cutoff = datetime.date.today() - datetime.timedelta(days=days)
+            stmt = (
+                select(SegmentPriceHistory)
+                .where(SegmentPriceHistory.segment_stats_id == segment_stats_id)
+                .where(SegmentPriceHistory.snapshot_date >= cutoff)
+                .order_by(SegmentPriceHistory.snapshot_date.asc())
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "price_history_fetched",
+                segment_stats_id=segment_stats_id,
+                days=days,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_price_history_failed",
+                segment_stats_id=segment_stats_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get price history: {exc}"
+            ) from exc
+
+    def mark_ads_disappeared(
+        self,
+        ad_ids: list[int],
+        days_threshold: int = 3,
+    ) -> None:
+        """Помечает объявления как исчезнувшие.
+
+        Для каждого объявления из ``ad_ids``:
+        - Устанавливает ``is_disappeared_quickly = True`` если
+          ``days_on_market <= days_threshold``.
+        - Устанавливает ``is_active = False`` (если поле существует).
+
+        Args:
+            ad_ids: Список внутренних ID объявлений (Ad.id).
+            days_threshold: Порог дней для признания быстрого исчезновения.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        if not ad_ids:
+            return
+        try:
+            stmt = select(Ad).where(Ad.id.in_(ad_ids))
+            ads = self.session.execute(stmt).scalars().all()
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+            marked = 0
+            for ad in ads:
+                if ad.days_on_market is not None and ad.days_on_market <= days_threshold:
+                    ad.is_disappeared_quickly = True
+                if hasattr(ad, "is_active"):
+                    ad.is_active = False
+                marked += 1
+
+            if marked:
+                self.session.flush()
+            logger.info(
+                "ads_marked_disappeared",
+                count=marked,
+                days_threshold=days_threshold,
+            )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "mark_ads_disappeared_failed",
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to mark ads disappeared: {exc}"
+            ) from exc
+
+    def update_ad_tracking_fields(
+        self,
+        ad_id: int,
+        last_seen_at: datetime.datetime | None = None,
+        days_on_market: int | None = None,
+        ad_category: str | None = None,
+        brand: str | None = None,
+        extracted_model: str | None = None,
+    ) -> None:
+        """Обновляет поля трекинга объявления.
+
+        Обновляет только переданные поля (не ``None``).
+
+        Args:
+            ad_id: Внутренний ID объявления (Ad.id).
+            last_seen_at: Время последнего обнаружения.
+            days_on_market: Количество дней на рынке.
+            ad_category: Категория объявления.
+            brand: Бренд товара.
+            extracted_model: Извлечённая модель товара.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            ad = self.session.get(Ad, ad_id)
+            if ad is None:
+                logger.warning(
+                    "ad_not_found_for_tracking_update",
+                    ad_id=ad_id,
+                )
+                return
+
+            updates = {
+                "last_seen_at": last_seen_at,
+                "days_on_market": days_on_market,
+                "ad_category": ad_category,
+                "brand": brand,
+                "extracted_model": extracted_model,
+            }
+            for key, value in updates.items():
+                if value is not None and hasattr(ad, key):
+                    setattr(ad, key, value)
+
+            self.session.flush()
+            updated_fields = [k for k, v in updates.items() if v is not None]
+            logger.debug(
+                "ad_tracking_fields_updated",
+                ad_id=ad_id,
+                fields=updated_fields,
+            )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "update_ad_tracking_fields_failed",
+                ad_id=ad_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to update ad tracking fields: {exc}"
+            ) from exc
+
+    def get_disappeared_ads(
+        self,
+        search_id: int,
+        since_days: int = 7,
+    ) -> list[Ad]:
+        """Возвращает объявления из поиска, которые были активны, но исчезли.
+
+        Это объявления, у которых ``last_seen_at < now - threshold`` и которые
+        ранее были активны (имеют ``search_url``, соответствующий поиску).
+
+        Args:
+            search_id: ID отслеживаемого поиска (TrackedSearch.id).
+            since_days: За сколько последних дней искать исчезнувшие.
+
+        Returns:
+            list[Ad]: Исчезнувшие объявления.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            tracked = self.session.get(TrackedSearch, search_id)
+            if tracked is None:
+                logger.warning(
+                    "tracked_search_not_found_for_disappeared",
+                    search_id=search_id,
+                )
+                return []
+
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+                days=since_days,
+            )
+            stmt = (
+                select(Ad)
+                .where(Ad.search_url == tracked.search_url)
+                .where(Ad.last_seen_at.is_not(None))
+                .where(Ad.last_seen_at < cutoff)
+                .where(Ad.first_seen_at >= cutoff)
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "disappeared_ads_fetched",
+                search_id=search_id,
+                since_days=since_days,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_disappeared_ads_failed",
+                search_id=search_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get disappeared ads: {exc}"
+            ) from exc
+
+    def get_segment_ads(
+        self,
+        search_id: int,
+        segment_key: str | None = None,
+        days: int = 30,
+        active_only: bool = True,
+    ) -> list[Ad]:
+        """Возвращает объявления сегмента за указанный период.
+
+        Если ``segment_key`` задан, фильтрует по ``brand`` +
+        ``extracted_model`` или ``ad_category``. Если нет — возвращает
+        все объявления для ``search_id`` за период.
+
+        Args:
+            search_id: ID отслеживаемого поиска (TrackedSearch.id).
+            segment_key: Ключ сегмента (опционально).
+            days: Количество дней для поиска.
+            active_only: Только активные (не исчезнувшие быстро).
+
+        Returns:
+            list[Ad]: Объявления сегмента.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            tracked = self.session.get(TrackedSearch, search_id)
+            if tracked is None:
+                logger.warning(
+                    "tracked_search_not_found_for_segment_ads",
+                    search_id=search_id,
+                )
+                return []
+
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+            stmt = (
+                select(Ad)
+                .where(Ad.search_url == tracked.search_url)
+                .where(Ad.first_seen_at >= cutoff)
+                .where(Ad.price.is_not(None))
+                .where(Ad.price > 0)
+            )
+
+            if active_only:
+                stmt = stmt.where(
+                    Ad.is_disappeared_quickly.is_(False)
+                    | Ad.is_disappeared_quickly.is_(None),
+                )
+
+            if segment_key is not None:
+                # segment_key может быть вида «brand:model» или «category:...»
+                parts = segment_key.split(":", 1)
+                if len(parts) == 2:
+                    key_type, key_value = parts
+                    if key_type == "category":
+                        stmt = stmt.where(Ad.ad_category == key_value)
+                    else:
+                        # brand:model — фильтруем по brand и extracted_model
+                        sub_parts = key_value.split(":", 1)
+                        if len(sub_parts) == 2:
+                            stmt = stmt.where(
+                                Ad.brand == sub_parts[0],
+                                Ad.extracted_model == sub_parts[1],
+                            )
+                        else:
+                            stmt = stmt.where(Ad.brand == key_value)
+
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "segment_ads_fetched",
+                search_id=search_id,
+                segment_key=segment_key,
+                days=days,
+                active_only=active_only,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_segment_ads_failed",
+                search_id=search_id,
+                segment_key=segment_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get segment ads: {exc}"
+            ) from exc
+
+    def calculate_fast_sale_stats(
+        self,
+        search_id: int,
+        segment_key: str | None = None,
+    ) -> dict:
+        """Агрегатный запрос: статистика быстрых продаж в сегменте.
+
+        Для объявлений с ``is_disappeared_quickly = True`` в сегменте
+        рассчитывает агрегатные метрики.
+
+        Args:
+            search_id: ID отслеживаемого поиска (TrackedSearch.id).
+            segment_key: Ключ сегмента (опционально).
+
+        Returns:
+            dict: {
+                ``fast_sale_count``: int,
+                ``fast_sale_price_median``: float | None,
+                ``fast_sale_price_mean``: float | None,
+                ``median_days_on_market``: float | None,
+            }
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            tracked = self.session.get(TrackedSearch, search_id)
+            if tracked is None:
+                logger.warning(
+                    "tracked_search_not_found_for_fast_sale",
+                    search_id=search_id,
+                )
+                return {
+                    "fast_sale_count": 0,
+                    "fast_sale_price_median": None,
+                    "fast_sale_price_mean": None,
+                    "median_days_on_market": None,
+                }
+
+            stmt = (
+                select(Ad)
+                .where(Ad.search_url == tracked.search_url)
+                .where(Ad.is_disappeared_quickly.is_(True))
+                .where(Ad.price.is_not(None))
+                .where(Ad.price > 0)
+            )
+
+            if segment_key is not None:
+                parts = segment_key.split(":", 1)
+                if len(parts) == 2:
+                    key_type, key_value = parts
+                    if key_type == "category":
+                        stmt = stmt.where(Ad.ad_category == key_value)
+                    else:
+                        sub_parts = key_value.split(":", 1)
+                        if len(sub_parts) == 2:
+                            stmt = stmt.where(
+                                Ad.brand == sub_parts[0],
+                                Ad.extracted_model == sub_parts[1],
+                            )
+                        else:
+                            stmt = stmt.where(Ad.brand == key_value)
+
+            ads = self.session.execute(stmt).scalars().all()
+
+            if not ads:
+                return {
+                    "fast_sale_count": 0,
+                    "fast_sale_price_median": None,
+                    "fast_sale_price_mean": None,
+                    "median_days_on_market": None,
+                }
+
+            prices = sorted([ad.price for ad in ads if ad.price])
+            days_list = sorted(
+                [ad.days_on_market for ad in ads if ad.days_on_market is not None],
+            )
+
+            fast_sale_price_median = None
+            if prices:
+                mid = len(prices) // 2
+                if len(prices) % 2 == 0:
+                    fast_sale_price_median = (prices[mid - 1] + prices[mid]) / 2
+                else:
+                    fast_sale_price_median = prices[mid]
+
+            fast_sale_price_mean = None
+            if prices:
+                fast_sale_price_mean = sum(prices) / len(prices)
+
+            median_days = None
+            if days_list:
+                mid = len(days_list) // 2
+                if len(days_list) % 2 == 0:
+                    median_days = (days_list[mid - 1] + days_list[mid]) / 2
+                else:
+                    median_days = days_list[mid]
+
+            result = {
+                "fast_sale_count": len(ads),
+                "fast_sale_price_median": fast_sale_price_median,
+                "fast_sale_price_mean": fast_sale_price_mean,
+                "median_days_on_market": median_days,
+            }
+            logger.debug(
+                "fast_sale_stats_calculated",
+                search_id=search_id,
+                segment_key=segment_key,
+                **result,
+            )
+            return result
+        except SQLAlchemyError as exc:
+            logger.error(
+                "calculate_fast_sale_stats_failed",
+                search_id=search_id,
+                segment_key=segment_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to calculate fast sale stats: {exc}"
+            ) from exc
+
+    def get_all_segment_stats_for_search(
+        self, search_id: int,
+    ) -> list[SegmentStats]:
+        """Возвращает все статистики сегментов для конкретного поиска.
+
+        Включает связанные записи истории (eager loading).
+
+        Args:
+            search_id: ID отслеживаемого поиска (TrackedSearch.id).
+
+        Returns:
+            list[SegmentStats]: Статистики сегментов с историей цен.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = (
+                select(SegmentStats)
+                .where(SegmentStats.search_id == search_id)
+                .options(selectinload(SegmentStats.price_history))
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "all_segment_stats_fetched",
+                search_id=search_id,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_all_segment_stats_for_search_failed",
+                search_id=search_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get all segment stats for search: {exc}"
             ) from exc
 
     # ------------------------------------------------------------------

@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+_engine: "Engine | None" = None
+_lock = threading.Lock()
 
 
 class Base(DeclarativeBase):
@@ -15,13 +23,45 @@ class Base(DeclarativeBase):
 
 
 def get_engine():
-    """Создаёт и возвращает движок SQLAlchemy.
+    """Создаёт и возвращает singleton-движок SQLAlchemy.
+
+    Использует двойную проверку с блокировкой (double-checked locking)
+    для потокобезопасного создания единственного экземпляра Engine.
 
     Returns:
         Engine: Экземпляр SQLAlchemy Engine для подключения к PostgreSQL.
     """
-    settings = get_settings()
-    return create_engine(settings.DATABASE_URL, echo=False)
+    global _engine
+    if _engine is None:
+        with _lock:
+            if _engine is None:
+                settings = get_settings()
+                _engine = create_engine(
+                    settings.DATABASE_URL,
+                    echo=False,
+                    pool_size=5,
+                    max_overflow=10,
+                    pool_pre_ping=True,
+                    pool_recycle=1800,
+                    connect_args={"connect_timeout": 10},
+                )
+                logger.info("database_engine_created", extra={
+                    "pool_size": 5,
+                    "pool_recycle": 1800,
+                })
+    return _engine
+
+
+def dispose_engine() -> None:
+    """Закрывает все подключения в пуле и сбрасывает singleton Engine.
+
+    Используется для graceful shutdown приложения.
+    """
+    global _engine
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None
+        logger.info("database_engine_disposed")
 
 
 def get_session_factory() -> sessionmaker:

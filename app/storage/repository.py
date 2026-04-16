@@ -270,11 +270,19 @@ class Repository:
 
             ad = Ad(ad_id=ad_id, url=url, search_url=search_url)
             self.session.add(ad)
+            savepoint = self.session.begin_nested()
             try:
                 self.session.flush()
+                savepoint.commit()
             except IntegrityError:
-                # Race condition: другой параллельный запрос уже вставил эту запись
-                self.session.rollback()
+                # Race condition: другой параллельный запрос уже вставил эту запись.
+                # Откатываем только SAVEPOINT, не трогая основную транзакцию.
+                savepoint.rollback()
+                logger.warning(
+                    "get_or_create_ad_savepoint_rollback",
+                    ad_id=ad_id,
+                )
+                self.session.expire_all()
                 stmt = select(Ad).where(Ad.ad_id == ad_id)
                 existing = self.session.execute(stmt).scalar_one_or_none()
                 if existing is not None:
@@ -561,6 +569,7 @@ class Repository:
             )
             return
 
+        savepoint = self.session.begin_nested()
         try:
             notification = NotificationSent(
                 ad_id=ad_id,
@@ -569,9 +578,9 @@ class Repository:
             )
             self.session.add(notification)
             self.session.flush()
-            # Немедленный коммит для гарантии, что запись NotificationSent
-            # зафиксирована в БД до фактической отправки уведомления.
-            self.session.commit()
+            savepoint.commit()
+            # flush() отправляет изменения в БД внутри транзакции.
+            # Pipeline сам сделает commit в конце цикла.
             logger.info(
                 "notification_marked_sent",
                 ad_id=ad_id,
@@ -579,9 +588,9 @@ class Repository:
                 telegram_message_id=telegram_message_id,
             )
         except IntegrityError:
-            # Дубль на уровне БД — откатываем и игнорируем
-            self.session.rollback()
-            logger.debug(
+            # Дубль на уровне БД — откатываем только SAVEPOINT
+            savepoint.rollback()
+            logger.warning(
                 "notification_duplicate_integrity",
                 ad_id=ad_id,
                 notification_type=notification_type,

@@ -120,8 +120,8 @@ class AvitoCollector:
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 directory = f"{self.settings.RAW_HTML_PATH}/search"
                 save_html(html, directory, f"search_error_{timestamp}")
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("save_error_html_failed", error=str(exc))
 
             raise CollectorError(
                 f"Failed to collect search page {url}: {exc}"
@@ -129,8 +129,8 @@ class AvitoCollector:
         finally:
             try:
                 await page.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("page_close_failed", error=str(exc))
 
     async def collect_ad_page(self, url: str) -> tuple[str, str]:
         """Открыть карточку объявления и вернуть ``(html, saved_path)``.
@@ -207,8 +207,8 @@ class AvitoCollector:
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 directory = f"{self.settings.RAW_HTML_PATH}/ad"
                 save_html(html, directory, f"ad_error_{timestamp}")
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("save_error_html_failed", error=str(exc))
 
             raise CollectorError(
                 f"Failed to collect ad page {url}: {exc}"
@@ -216,8 +216,8 @@ class AvitoCollector:
         finally:
             try:
                 await page.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("page_close_failed", error=str(exc))
 
     async def _wait_for_selectors(
         self,
@@ -256,7 +256,8 @@ class AvitoCollector:
                     selector=selector,
                 )
                 return False
-            except Exception:
+            except Exception as exc:
+                self.logger.debug("selector_wait_failed", error=str(exc))
                 continue
 
         return False

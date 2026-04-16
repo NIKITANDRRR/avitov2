@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from datetime import datetime, timezone
 
+import psutil
 import structlog
 
 from app.config import get_settings
@@ -191,13 +193,13 @@ class Pipeline:
         """
         setup_logging(self.settings.LOG_LEVEL)
         self.logger.info("search_cycle_starting")
+        cycle_start = time.monotonic()
+        process = psutil.Process()
+        self.logger.info("cycle_memory_start", 
+            memory_mb=round(process.memory_info().rss / 1024 / 1024, 1))
 
         # Сброс статистики
         self.stats = {k: 0 for k in self.stats}
-
-        # Автосоздание таблиц при необходимости
-        from app.storage.database import ensure_tables
-        ensure_tables()
 
         session = get_session()
         repo = Repository(session)
@@ -245,10 +247,10 @@ class Pipeline:
 
                 for batch_idx, batch in enumerate(batches):
                     self.logger.info(
-                        "processing_batch",
-                        batch_idx=batch_idx + 1,
+                        "pipeline_heartbeat",
+                        batch_num=batch_idx + 1,
                         total_batches=len(batches),
-                        batch_size=len(batch),
+                        memory_mb=round(process.memory_info().rss / 1024 / 1024, 1),
                     )
 
                     # Обрабатываем батч параллельно с семафором
@@ -304,7 +306,12 @@ class Pipeline:
                     "repository_close_error", error=str(exc),
                 )
 
-        self.logger.info("search_cycle_completed", **self.stats)
+        self.logger.info(
+            "cycle_completed",
+            duration_seconds=round(time.monotonic() - cycle_start, 1),
+            memory_mb=round(process.memory_info().rss / 1024 / 1024, 1),
+            **self.stats,
+        )
         return self.stats
 
     # ------------------------------------------------------------------
@@ -329,6 +336,7 @@ class Pipeline:
             semaphore: Семафор для ограничения параллельности.
         """
         async with semaphore:
+            search_start = time.monotonic()
             try:
                 # Задержка между поисками в батче
                 await asyncio.sleep(self.settings.SEARCH_DELAY_SECONDS)
@@ -350,9 +358,9 @@ class Pipeline:
 
                 self.stats["searches_processed"] += 1
                 self.logger.info(
-                    "tracked_search_processed",
-                    search_id=search.id,
+                    "search_processed",
                     search_url=search.search_url,
+                    duration_seconds=round(time.monotonic() - search_start, 1),
                 )
 
             except Exception as exc:
@@ -648,6 +656,7 @@ class Pipeline:
         ad_id = extract_ad_id_from_url(search_item.url)
         normalized_url = normalize_url(search_item.url)
 
+        savepoint = repo.session.begin_nested()
         try:
             # Задержка перед сбором
             await random_delay(
@@ -710,6 +719,8 @@ class Pipeline:
                 html_path=html_path,
             )
 
+            savepoint.commit()
+
             self.logger.info(
                 "ad_processed",
                 ad_id=ad_id,
@@ -719,6 +730,7 @@ class Pipeline:
             return ad_id
 
         except Exception as exc:
+            savepoint.rollback()
             self.stats["errors"] += 1
             self.logger.error(
                 "ad_card_failed",
@@ -727,7 +739,6 @@ class Pipeline:
                 error=str(exc),
             )
             try:
-                repo.rollback()
                 repo.update_ad(
                     ad_id,
                     parse_status="failed",
@@ -844,6 +855,7 @@ class Pipeline:
             searches: Список обработанных поисков.
             analyzer: Экземпляр анализатора цен.
         """
+        analyze_start = time.monotonic()
         all_undervalued: list[UndervaluedAd] = []
 
         accessory_filter = AccessoryFilter(
@@ -992,6 +1004,12 @@ class Pipeline:
                 )
 
         self.stats["ads_undervalued"] = len(all_undervalued)
+
+        self.logger.info(
+            "analysis_completed",
+            duration_seconds=round(time.monotonic() - analyze_start, 1),
+            undervalued_count=len(all_undervalued),
+        )
 
         # Фиксируем аналитические данные в БД до отправки уведомлений,
         # чтобы записи NotificationSent (из mark_notification_sent) были

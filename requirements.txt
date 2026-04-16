@@ -12,3 +12,4 @@ typer==0.15.2
 structlog==24.4.0
 numpy==2.2.4
 aiosmtplib>=3.0.0
+psutil>=5.9.0

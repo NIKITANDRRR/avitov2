@@ -525,10 +525,22 @@ class Pipeline:
                     )
                     await asyncio.sleep(interval)
 
+        # Дообработка pending объявлений
+        try:
+            pending_stats = await self.run_force_pending_cycle()
+            total_stats["pending_processed"] = pending_stats.get("pending_processed", 0)
+            total_stats["pending_success"] = pending_stats.get("pending_success", 0)
+            total_stats["pending_failed"] = pending_stats.get("pending_failed", 0)
+        except Exception as e:
+            self.logger.error("force_parse_pending_error", error=str(e))
+
         self.logger.info(
             "force_parse_completed",
             products_parsed=total_stats["products_parsed"],
             categories_parsed=total_stats["categories_parsed"],
+            pending_processed=total_stats.get("pending_processed", 0),
+            pending_success=total_stats.get("pending_success", 0),
+            pending_failed=total_stats.get("pending_failed", 0),
         )
         return total_stats
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
@@ -16,6 +16,8 @@ from app.storage.models import (
     AdSnapshot,
     NotificationSent,
     SearchRun,
+    Seller,
+    SoldItem,
     TrackedSearch,
     SegmentStats,
     SegmentPriceHistory,
@@ -245,6 +247,34 @@ class Repository:
                 f"Failed to get ad by ad_id: {exc}"
             ) from exc
 
+    def get_pending_ads(self, limit: int | None = None) -> list[Ad]:
+        """Получить объявления в статусе pending.
+
+        Возвращает все объявления с ``parse_status='pending'``,
+        отсортированные по времени первого обнаружения (от старых к новым).
+
+        Args:
+            limit: Максимум записей. Если ``None`` — без ограничения.
+
+        Returns:
+            list[Ad]: Список объявлений в статусе pending.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            query = self.session.query(Ad).filter(
+                Ad.parse_status == "pending",
+            ).order_by(Ad.first_seen_at.asc())
+            if limit:
+                query = query.limit(limit)
+            return query.all()
+        except Exception as exc:
+            logger.error("get_pending_ads_failed", error=str(exc))
+            raise StorageError(
+                f"Failed to get pending ads: {exc}"
+            ) from exc
+
     def get_or_create_ad(
         self, ad_id: str, url: str, search_url: str,
     ) -> tuple[Ad, bool]:
@@ -363,10 +393,16 @@ class Repository:
                 if aid in existing:
                     created_flags[aid] = False
                 else:
+                    title = item.get("title")
+                    price = item.get("price")
+                    if price is not None and price < 0:
+                        price = None
                     ad = Ad(
                         ad_id=aid,
                         url=item["url"],
                         search_url=item["search_url"],
+                        title=title,
+                        price=price,
                     )
                     self.session.add(ad)
                     new_ads.append(ad)
@@ -967,41 +1003,48 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
-            stmt = (
-                select(SegmentStats)
-                .where(SegmentStats.search_id == search_id)
-                .where(SegmentStats.segment_key == segment_key)
-            )
-            existing = self.session.execute(stmt).scalar_one_or_none()
+            savepoint = self.session.begin_nested()
+            try:
+                stmt = (
+                    select(SegmentStats)
+                    .where(SegmentStats.search_id == search_id)
+                    .where(SegmentStats.segment_key == segment_key)
+                )
+                existing = self.session.execute(stmt).scalar_one_or_none()
 
-            if existing is not None:
-                for key, value in stats.items():
-                    if hasattr(existing, key):
-                        setattr(existing, key, value)
-                existing.calculated_at = datetime.datetime.now(datetime.timezone.utc)
-                existing.updated_at = datetime.datetime.now(datetime.timezone.utc)
-                self.session.flush()
-                logger.debug(
-                    "segment_stats_updated",
+                if existing is not None:
+                    for key, value in stats.items():
+                        if hasattr(existing, key):
+                            setattr(existing, key, value)
+                    existing.calculated_at = datetime.datetime.now(datetime.timezone.utc)
+                    existing.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                    self.session.flush()
+                    logger.debug(
+                        "segment_stats_updated",
+                        search_id=search_id,
+                        segment_key=segment_key,
+                    )
+                    savepoint.commit()
+                    return existing
+
+                new_stats = SegmentStats(
                     search_id=search_id,
                     segment_key=segment_key,
+                    **{k: v for k, v in stats.items() if hasattr(SegmentStats, k)},
                 )
-                return existing
-
-            new_stats = SegmentStats(
-                search_id=search_id,
-                segment_key=segment_key,
-                **{k: v for k, v in stats.items() if hasattr(SegmentStats, k)},
-            )
-            self.session.add(new_stats)
-            self.session.flush()
-            logger.info(
-                "segment_stats_created",
-                search_id=search_id,
-                segment_key=segment_key,
-                stats_id=new_stats.id,
-            )
-            return new_stats
+                self.session.add(new_stats)
+                self.session.flush()
+                logger.info(
+                    "segment_stats_created",
+                    search_id=search_id,
+                    segment_key=segment_key,
+                    stats_id=new_stats.id,
+                )
+                savepoint.commit()
+                return new_stats
+            except Exception as inner_exc:
+                savepoint.rollback()
+                raise inner_exc
         except SQLAlchemyError as exc:
             logger.error(
                 "upsert_segment_stats_failed",
@@ -1599,6 +1642,533 @@ class Repository:
             )
             raise StorageError(
                 f"Failed to get all segment stats for search: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Seller
+    # ------------------------------------------------------------------
+
+    def get_or_create_seller(
+        self,
+        seller_id: str,
+        seller_url: str | None = None,
+        seller_name: str | None = None,
+    ) -> Seller:
+        """Найти или создать продавца по Avito seller_id.
+
+        Использует SAVEPOINT для защиты от race condition при
+        параллельной вставке.
+
+        Args:
+            seller_id: Строковый ID продавца на Avito.
+            seller_url: URL профиля продавца (опционально).
+            seller_name: Имя продавца (опционально).
+
+        Returns:
+            Seller: Найденный или созданный объект продавца.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = select(Seller).where(Seller.seller_id == seller_id)
+            existing = self.session.execute(stmt).scalar_one_or_none()
+            if existing is not None:
+                logger.debug(
+                    "seller_found",
+                    seller_id=seller_id,
+                    db_id=existing.id,
+                )
+                return existing
+
+            seller = Seller(
+                seller_id=seller_id,
+                seller_url=seller_url,
+                seller_name=seller_name,
+            )
+            self.session.add(seller)
+            savepoint = self.session.begin_nested()
+            try:
+                self.session.flush()
+                savepoint.commit()
+            except IntegrityError:
+                # Race condition: другой поток уже вставил запись
+                savepoint.rollback()
+                logger.warning(
+                    "get_or_create_seller_savepoint_rollback",
+                    seller_id=seller_id,
+                )
+                self.session.expire_all()
+                stmt = select(Seller).where(Seller.seller_id == seller_id)
+                existing = self.session.execute(stmt).scalar_one_or_none()
+                if existing is not None:
+                    logger.info(
+                        "seller_created_by_another_thread",
+                        seller_id=seller_id,
+                        db_id=existing.id,
+                    )
+                    return existing
+                raise
+
+            logger.info(
+                "seller_created",
+                seller_id=seller_id,
+                db_id=seller.id,
+            )
+            return seller
+        except IntegrityError as exc:
+            logger.error(
+                "get_or_create_seller_integrity_error",
+                seller_id=seller_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get or create seller (integrity): {exc}"
+            ) from exc
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_or_create_seller_failed",
+                seller_id=seller_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get or create seller: {exc}"
+            ) from exc
+
+    def update_seller(self, seller_id: str, **kwargs) -> bool:
+        """Обновить поля продавца по Avito seller_id.
+
+        Args:
+            seller_id: Строковый ID продавца на Avito.
+            **kwargs: Поля для обновления. Поддерживаются:
+                seller_name, rating, reviews_count, total_sold_items,
+                last_scraped_at, scrape_status, seller_url.
+
+        Returns:
+            bool: ``True``, если продавец найден и обновлён; ``False``, если не найден.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = select(Seller).where(Seller.seller_id == seller_id)
+            seller = self.session.execute(stmt).scalar_one_or_none()
+            if seller is None:
+                logger.warning(
+                    "seller_not_found_for_update",
+                    seller_id=seller_id,
+                )
+                return False
+
+            allowed_fields = {
+                "seller_name", "rating", "reviews_count",
+                "total_sold_items", "last_scraped_at",
+                "scrape_status", "seller_url",
+            }
+            for key, value in kwargs.items():
+                if key in allowed_fields and hasattr(seller, key):
+                    setattr(seller, key, value)
+
+            self.session.flush()
+            logger.info(
+                "seller_updated",
+                seller_id=seller_id,
+                updated_fields=list(kwargs.keys()),
+            )
+            return True
+        except SQLAlchemyError as exc:
+            logger.error(
+                "update_seller_failed",
+                seller_id=seller_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to update seller: {exc}"
+            ) from exc
+
+    def get_seller_by_id(self, seller_id: str) -> Seller | None:
+        """Найти продавца по Avito seller_id.
+
+        Args:
+            seller_id: Строковый ID продавца на Avito.
+
+        Returns:
+            Seller | None: Найденный продавец или ``None``.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = select(Seller).where(Seller.seller_id == seller_id)
+            result = self.session.execute(stmt).scalar_one_or_none()
+            if result is not None:
+                logger.debug(
+                    "seller_found_by_id",
+                    seller_id=seller_id,
+                    db_id=result.id,
+                )
+            else:
+                logger.debug("seller_not_found_by_id", seller_id=seller_id)
+            return result
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_seller_by_id_failed",
+                seller_id=seller_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get seller by id: {exc}"
+            ) from exc
+
+    def get_sellers_due_for_scrape(
+        self,
+        limit: int = 5,
+        interval_hours: float = 24.0,
+    ) -> list[Seller]:
+        """Получить продавцов, которых нужно парсить.
+
+        Возвращает продавцов, которые:
+        - никогда не парсились (``last_scraped_at IS NULL``);
+        - или не парсились более ``interval_hours`` часов;
+        - при этом ``scrape_status`` не ``'failed'``, либо последняя
+          попытка была более ``interval_hours`` назад.
+
+        Результат отсортирован по ``last_scraped_at ASC NULLS FIRST``.
+
+        Args:
+            limit: Максимум записей.
+            interval_hours: Интервал повторного парсинга в часах.
+
+        Returns:
+            list[Seller]: Список продавцов для парсинга.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+                hours=interval_hours,
+            )
+            stmt = (
+                select(Seller)
+                .where(
+                    # Никогда не парсились ИЛИ парсились давно
+                    (Seller.last_scraped_at.is_(None))
+                    | (Seller.last_scraped_at < cutoff)
+                )
+                .where(
+                    # Не failed, ИЛИ failed но последняя попытка давно
+                    (Seller.scrape_status != "failed")
+                    | (Seller.last_scraped_at.is_(None))
+                    | (Seller.last_scraped_at < cutoff)
+                )
+                .order_by(Seller.last_scraped_at.asc().nullsfirst())
+                .limit(limit)
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "sellers_due_for_scrape_fetched",
+                count=len(results),
+                limit=limit,
+                interval_hours=interval_hours,
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_sellers_due_for_scrape_failed",
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get sellers due for scrape: {exc}"
+            ) from exc
+
+    def link_ad_to_seller(self, ad_id: int, seller_id_fk: int) -> bool:
+        """Привязать объявление к продавцу.
+
+        Устанавливает ``seller_id_fk`` для объявления.
+
+        Args:
+            ad_id: Внутренний ID объявления (``Ad.id``).
+            seller_id_fk: Внутренний ID продавца (``Seller.id``).
+
+        Returns:
+            bool: ``True``, если объявление найдено и обновлено; ``False``, если не найдено.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            ad = self.session.get(Ad, ad_id)
+            if ad is None:
+                logger.warning("ad_not_found_for_link", ad_id=ad_id)
+                return False
+
+            ad.seller_id_fk = seller_id_fk
+            self.session.flush()
+            logger.info(
+                "ad_linked_to_seller",
+                ad_id=ad_id,
+                seller_id_fk=seller_id_fk,
+            )
+            return True
+        except SQLAlchemyError as exc:
+            logger.error(
+                "link_ad_to_seller_failed",
+                ad_id=ad_id,
+                seller_id_fk=seller_id_fk,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to link ad to seller: {exc}"
+            ) from exc
+
+    def get_unlinked_seller_ads(self) -> list[Ad]:
+        """Получить объявления с заполненным seller_name, но без seller_id_fk.
+
+        Возвращает объявления, у которых указано имя продавца
+        (``seller_name IS NOT NULL``), но ещё нет привязки к таблице
+        продавцов (``seller_id_fk IS NULL``).
+
+        Returns:
+            list[Ad]: Список непривязанных объявлений.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = (
+                select(Ad)
+                .where(Ad.seller_name.is_not(None))
+                .where(Ad.seller_id_fk.is_(None))
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "unlinked_seller_ads_fetched",
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_unlinked_seller_ads_failed",
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get unlinked seller ads: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # SoldItem
+    # ------------------------------------------------------------------
+
+    def save_sold_items(self, seller_db_id: int, items: list[dict]) -> int:
+        """Сохранить список проданных товаров продавца.
+
+        Для каждого товара проверяет, не сохранён ли уже (по уникальной
+        паре ``item_id`` + ``seller_id_fk``). Если ``item_id`` равен
+        ``None``, пропускает проверку дубликатов.
+
+        Args:
+            seller_db_id: Внутренний ID продавца (``Seller.id``).
+            items: Список словарей с данными проданных товаров.
+                Ожидаемые ключи: ``item_id``, ``title``, ``price``,
+                ``price_str``, ``category``, ``sold_date``, ``item_url``.
+
+        Returns:
+            int: Количество новых сохранённых товаров.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        if not items:
+            return 0
+
+        try:
+            saved_count = 0
+
+            # Собрать item_id для массовой проверки дубликатов
+            item_ids = [
+                item["item_id"] for item in items
+                if item.get("item_id") is not None
+            ]
+
+            existing_item_ids: set[str | None] = set()
+            if item_ids:
+                stmt = (
+                    select(SoldItem.item_id)
+                    .where(
+                        SoldItem.seller_id_fk == seller_db_id,
+                        SoldItem.item_id.in_(item_ids),
+                    )
+                )
+                rows = self.session.execute(stmt).scalars().all()
+                existing_item_ids = set(rows)
+
+            for item_data in items:
+                item_id = item_data.get("item_id")
+
+                # Проверка дубликатов по (seller_id_fk, item_id)
+                if item_id is not None and item_id in existing_item_ids:
+                    logger.debug(
+                        "sold_item_already_exists",
+                        item_id=item_id,
+                        seller_db_id=seller_db_id,
+                    )
+                    continue
+
+                sold_item = SoldItem(
+                    seller_id_fk=seller_db_id,
+                    item_id=item_id,
+                    title=item_data.get("title", ""),
+                    price=item_data.get("price"),
+                    price_str=item_data.get("price_str"),
+                    category=item_data.get("category"),
+                    sold_date=item_data.get("sold_date"),
+                    item_url=item_data.get("item_url"),
+                )
+                self.session.add(sold_item)
+                saved_count += 1
+
+            if saved_count > 0:
+                self.session.flush()
+
+            logger.info(
+                "sold_items_saved",
+                seller_db_id=seller_db_id,
+                total_items=len(items),
+                new_items=saved_count,
+            )
+            return saved_count
+        except SQLAlchemyError as exc:
+            logger.error(
+                "save_sold_items_failed",
+                seller_db_id=seller_db_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to save sold items: {exc}"
+            ) from exc
+
+    def get_sold_items_by_seller(
+        self,
+        seller_id: str,
+        limit: int = 100,
+    ) -> list[SoldItem]:
+        """Получить проданные товары продавца по Avito seller_id.
+
+        Args:
+            seller_id: Строковый ID продавца на Avito.
+            limit: Максимум записей.
+
+        Returns:
+            list[SoldItem]: Список проданных товаров.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = (
+                select(SoldItem)
+                .join(Seller, SoldItem.seller_id_fk == Seller.id)
+                .where(Seller.seller_id == seller_id)
+                .order_by(SoldItem.created_at.desc())
+                .limit(limit)
+            )
+            results = self.session.execute(stmt).scalars().all()
+            logger.debug(
+                "sold_items_fetched_by_seller",
+                seller_id=seller_id,
+                count=len(results),
+            )
+            return list(results)
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_sold_items_by_seller_failed",
+                seller_id=seller_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get sold items by seller: {exc}"
+            ) from exc
+
+    def get_seller_sold_stats(self, seller_id: str) -> dict | None:
+        """Получить агрегированную статистику продаж продавца.
+
+        Рассчитывает статистику по проданным товарам продавца:
+        количество, средняя/мин/макс/медианная цена, список категорий.
+
+        Args:
+            seller_id: Строковый ID продавца на Avito.
+
+        Returns:
+            dict | None: Словарь со статистикой или ``None``,
+                если продавец не найден. Поля:
+                ``total_sold``, ``avg_price``, ``min_price``,
+                ``max_price``, ``median_price``, ``categories``.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            # Проверяем существование продавца
+            seller_stmt = select(Seller).where(Seller.seller_id == seller_id)
+            seller = self.session.execute(seller_stmt).scalar_one_or_none()
+            if seller is None:
+                logger.debug(
+                    "seller_not_found_for_stats",
+                    seller_id=seller_id,
+                )
+                return None
+
+            # Агрегатный запрос (медиана через percentile_cont на стороне БД)
+            stmt = (
+                select(
+                    func.count(SoldItem.id).label("total_sold"),
+                    func.avg(SoldItem.price).label("avg_price"),
+                    func.min(SoldItem.price).label("min_price"),
+                    func.max(SoldItem.price).label("max_price"),
+                    func.percentile_cont(0.5).within_group(
+                        SoldItem.price
+                    ).label("median_price"),
+                )
+                .where(SoldItem.seller_id_fk == seller.id)
+                .where(SoldItem.price.is_not(None))
+            )
+            row = self.session.execute(stmt).one()
+
+            # Уникальные категории
+            categories_stmt = (
+                select(SoldItem.category)
+                .where(SoldItem.seller_id_fk == seller.id)
+                .where(SoldItem.category.is_not(None))
+                .distinct()
+            )
+            categories = list(
+                self.session.execute(categories_stmt).scalars().all()
+            )
+
+            stats = {
+                "total_sold": row.total_sold or 0,
+                "avg_price": float(row.avg_price) if row.avg_price is not None else None,
+                "min_price": float(row.min_price) if row.min_price is not None else None,
+                "max_price": float(row.max_price) if row.max_price is not None else None,
+                "median_price": float(row.median_price) if row.median_price is not None else None,
+                "categories": categories,
+            }
+
+            logger.debug(
+                "seller_sold_stats_fetched",
+                seller_id=seller_id,
+                total_sold=stats["total_sold"],
+            )
+            return stats
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_seller_sold_stats_failed",
+                seller_id=seller_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get seller sold stats: {exc}"
             ) from exc
 
     # ------------------------------------------------------------------

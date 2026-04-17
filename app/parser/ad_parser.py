@@ -27,6 +27,9 @@ class AdData:
         price_str: Сырая строка цены.
         location: Местоположение / адрес.
         seller_name: Имя продавца.
+        seller_id: Avito seller ID (из URL профиля).
+        seller_url: URL профиля продавца.
+        seller_type: Тип продавца (частный, компания, магазин).
         condition: Состояние товара (Новое / Б/у).
         publication_date: Дата публикации (datetime или None).
         description: Описание объявления.
@@ -39,9 +42,12 @@ class AdData:
     price_str: str | None
     location: str | None
     seller_name: str | None
-    condition: str | None
-    publication_date: datetime.datetime | None
-    description: str | None
+    seller_id: str | None = None
+    seller_url: str | None = None
+    seller_type: str | None = None
+    condition: str | None = None
+    publication_date: datetime.datetime | None = None
+    description: str | None = None
 
 
 def parse_ad_page(html: str, url: str) -> AdData:
@@ -111,6 +117,61 @@ def parse_ad_page(html: str, url: str) -> AdData:
             '[class*="seller-info"] a',
         ])
 
+        # --- seller_url ---
+        seller_url = _safe_extract_attr(soup, "seller_url", [
+            '[data-marker="seller-info/link"]',
+            'a[href*="/user/"]',
+            'a[href*="/u/"]',
+            '[data-marker*="seller"] a[href]',
+            'a[href*="/profile/"]',
+            '[class*="seller-info"] a[href]',
+            '[class*="SellerInfo"] a[href]',
+            '[data-marker="seller-info/name"]',
+        ], attr="href")
+
+        # Fallback: поиск seller URL в JSON-LD или скриптах страницы
+        if not seller_url:
+            seller_url = _extract_seller_url_from_scripts(soup)
+
+        # Fallback: парсинг __NEXT_DATA__ (React/Next)
+        next_data_seller = _extract_seller_data_from_next_data(soup)
+
+        # Если seller_url всё ещё не найден — попробовать из __NEXT_DATA__
+        if not seller_url:
+            seller_url = next_data_seller.get("seller_url")
+
+        # Если найдена относительная ссылка, добавить домен
+        if seller_url and seller_url.startswith("/"):
+            seller_url = "https://www.avito.ru" + seller_url
+
+        # --- seller_id ---
+        seller_id: str | None = None
+        if seller_url:
+            # Паттерн /user/SELLER_ID
+            match = re.search(r"/user/([^/?#]+)", seller_url)
+            if match:
+                seller_id = match.group(1)
+            else:
+                # Паттерн /u/SELLER_ID (новый формат Avito)
+                match = re.search(r"/u/([^/?#]+)", seller_url)
+                if match:
+                    seller_id = match.group(1)
+
+        # Если seller_id не найден через URL — попробовать из __NEXT_DATA__
+        if not seller_id:
+            seller_id = next_data_seller.get("seller_id")
+
+        # --- seller_type ---
+        seller_type: str | None = None
+        try:
+            # Сначала из HTML-блока продавца
+            seller_type = _extract_seller_type(soup)
+        except Exception:
+            pass
+        if not seller_type:
+            # Fallback из __NEXT_DATA__
+            seller_type = next_data_seller.get("seller_type")
+
         # --- condition ---
         condition = _extract_condition(soup)
 
@@ -135,6 +196,9 @@ def parse_ad_page(html: str, url: str) -> AdData:
             price_str=price_str,
             location=location,
             seller_name=seller_name,
+            seller_id=seller_id,
+            seller_url=seller_url,
+            seller_type=seller_type,
             condition=condition,
             publication_date=publication_date,
             description=description,
@@ -147,7 +211,18 @@ def parse_ad_page(html: str, url: str) -> AdData:
             has_title=title is not None,
             has_price=price is not None,
             has_location=location is not None,
+            seller_id=seller_id,
+            seller_url=seller_url,
+            seller_type=seller_type,
         )
+
+        if seller_id is None:
+            log.debug(
+                "ad_page_parsed_no_seller",
+                url=url,
+                ad_id=ad_id,
+                seller_name=seller_name,
+            )
 
         return ad_data
 
@@ -155,6 +230,236 @@ def parse_ad_page(html: str, url: str) -> AdData:
         raise ParserError(
             f"Failed to parse ad page {url}: {exc}"
         ) from exc
+
+
+def _extract_seller_url_from_scripts(soup: BeautifulSoup) -> str | None:
+    """Извлечь URL профиля продавца из встроенных скриптов страницы.
+
+    Avito часто встраивает данные о продавце в JSON внутри <script> тегов.
+    Ищет URL профиля продавца в формате /user/... или /u/... .
+
+    Args:
+        soup: BeautifulSoup объект страницы.
+
+    Returns:
+        str | None: URL профиля продавца или ``None``.
+    """
+    import json
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            text = script.get_text(strip=True)
+            if not text:
+                continue
+            data = json.loads(text)
+            # Поиск seller URL в JSON-LD
+            if isinstance(data, dict):
+                seller = data.get("seller", {})
+                if isinstance(seller, dict):
+                    url_val = seller.get("url") or seller.get("@id")
+                    if url_val and ("/user/" in str(url_val) or "/u/" in str(url_val)):
+                        return str(url_val)
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            continue
+
+    # Поиск в обычных <script> тегах
+    for script in soup.find_all("script"):
+        try:
+            text = script.get_text()
+            if not text:
+                continue
+            # Ищем паттерн /user/HASH или /u/HASH в JavaScript
+            match = re.search(r'["\'](?:https?://(?:www\.)?avito\.ru)?(/(?:user|u)/[^"\'/?#]+)', text)
+            if match:
+                return "https://www.avito.ru" + match.group(1)
+        except Exception:
+            continue
+
+    return None
+
+
+def _extract_seller_data_from_next_data(
+    soup: BeautifulSoup,
+) -> dict[str, str | None]:
+    """Извлечь данные продавца из ``<script id=\"__NEXT_DATA__\">``.
+
+    Avito (React/Next) встраивает начальный state в JSON внутри тега
+    ``<script id="__NEXT_DATA__">``.  Функция рекурсивно ищет в этом JSON
+    поля ``seller``, ``owner``, ``userId``, ``profileUrl``, ``ownerId``.
+
+    Args:
+        soup: BeautifulSoup объект страницы.
+
+    Returns:
+        dict: Словарь с ключами ``seller_id``, ``seller_url``, ``seller_type``.
+              Значения — строки или ``None``.
+    """
+    import json
+
+    result: dict[str, str | None] = {
+        "seller_id": None,
+        "seller_url": None,
+        "seller_type": None,
+    }
+
+    try:
+        script_tag = soup.select_one('script[id="__NEXT_DATA__"]')
+        if script_tag is None:
+            log.debug("next_data_script_not_found")
+            return result
+
+        text = script_tag.get_text(strip=True)
+        if not text:
+            return result
+
+        data = json.loads(text)
+    except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+        log.debug("next_data_parse_error", error=str(exc))
+        return result
+
+    # Рекурсивный поиск нужных полей в JSON
+    _found: dict[str, str] = {}
+
+    def _walk(obj: object, depth: int = 0) -> None:
+        """Рекурсивно обойти JSON и собрать seller-поля."""
+        if depth > 15 or len(_found) >= 5:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str):
+                    low = key.lower()
+                    if low in ("userid", "ownerid", "sellerid") and "id" not in _found:
+                        _found["id"] = value
+                    elif low in ("profileurl", "sellerurl", "ownerurl") and "url" not in _found:
+                        if "/user/" in value or "/u/" in value or "/profile/" in value:
+                            _found["url"] = value
+                elif isinstance(value, (dict, list)):
+                    _walk(value, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, depth + 1)
+
+    try:
+        _walk(data)
+    except Exception as exc:
+        log.debug("next_data_walk_error", error=str(exc))
+
+    # Извлечь seller_id
+    if "id" in _found:
+        result["seller_id"] = _found["id"]
+
+    # Извлечь seller_url
+    if "url" in _found:
+        url_val = _found["url"]
+        if url_val.startswith("/"):
+            url_val = "https://www.avito.ru" + url_val
+        result["seller_url"] = url_val
+
+    # Попытка извлечь seller_type из __NEXT_DATA__
+    try:
+        _type = _extract_seller_type_from_json(data)
+        if _type:
+            result["seller_type"] = _type
+    except Exception:
+        pass
+
+    return result
+
+
+def _extract_seller_type_from_json(data: object) -> str | None:
+    """Попытаться извлечь тип продавца из JSON-структуры __NEXT_DATA__.
+
+    Ищет поля ``sellerType``, ``type``, ``accountType`` и нормализует.
+
+    Args:
+        data: Распарсенный JSON.
+
+    Returns:
+        str | None: ``private``, ``company``, ``shop`` или ``None``.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # Прямой поиск в seller-подобъекте
+    for key in ("seller", "owner"):
+        obj = data.get(key)
+        if isinstance(obj, dict):
+            for field in ("sellerType", "type", "accountType"):
+                val = obj.get(field)
+                if isinstance(val, str):
+                    normalized = _normalize_seller_type(val)
+                    if normalized:
+                        return normalized
+
+    # Рекурсивный поиск
+    for value in data.values():
+        if isinstance(value, dict):
+            result = _extract_seller_type_from_json(value)
+            if result:
+                return result
+
+    return None
+
+
+def _normalize_seller_type(raw: str) -> str | None:
+    """Нормализовать строку типа продавца к enum-значению.
+
+    Args:
+        raw: Сырая строка (например «Частное лицо», «Компания»).
+
+    Returns:
+        str | None: ``private``, ``company``, ``shop`` или ``None``.
+    """
+    if not raw:
+        return None
+    low = raw.strip().lower()
+    if low in ("частное лицо", "private", "личное"):
+        return "private"
+    if low in ("компания", "company", "юридическое лицо", "юридическое"):
+        return "company"
+    if low in ("магазин", "shop", "store", "торговая площадка"):
+        return "shop"
+    # Частичные совпадения
+    if "частн" in low or "private" in low:
+        return "private"
+    if "компан" in low or "коммерч" in low or "company" in low:
+        return "company"
+    if "магазин" in low or "shop" in low or "store" in low:
+        return "shop"
+    return None
+
+
+def _extract_seller_type(soup: BeautifulSoup) -> str | None:
+    """Извлечь тип продавца из HTML-блока продавца.
+
+    Ищет текст в блоках с data-marker или class, содержащими «seller»,
+    и нормализует к ``private``, ``company`` или ``shop``.
+
+    Args:
+        soup: BeautifulSoup объект страницы.
+
+    Returns:
+        str | None: ``private``, ``company``, ``shop`` или ``None``.
+    """
+    selectors = [
+        '[data-marker*="seller"]',
+        '[class*="seller"]',
+        '[class*="Seller"]',
+    ]
+    for selector in selectors:
+        try:
+            elements = soup.select(selector)
+            for el in elements:
+                text = el.get_text(separator=" ", strip=True)
+                if not text:
+                    continue
+                seller_type = _normalize_seller_type(text)
+                if seller_type:
+                    return seller_type
+        except Exception:
+            continue
+
+    return None
 
 
 def _safe_extract(
@@ -186,6 +491,40 @@ def _safe_extract(
                     text = element.get_text(strip=True)
                 if text:
                     return text
+        except Exception:
+            continue
+
+    log.debug("field_not_found", field=field_name)
+    return None
+
+
+def _safe_extract_attr(
+    soup: BeautifulSoup,
+    field_name: str,
+    selectors: list[str],
+    attr: str = "href",
+) -> str | None:
+    """Безопасно извлечь атрибут элемента по списку fallback-селекторов.
+
+    Перебирает селекторы по приоритету. Логирует warning, если ни один
+    селектор не сработал.
+
+    Args:
+        soup: BeautifulSoup объект страницы.
+        field_name: Имя поля (для логирования).
+        selectors: Список CSS-селекторов по приоритету.
+        attr: Имя атрибута для извлечения (по умолчанию ``href``).
+
+    Returns:
+        str | None: Значение атрибута первого найденного элемента или ``None``.
+    """
+    for selector in selectors:
+        try:
+            element = soup.select_one(selector)
+            if element:
+                value = element.get(attr, "")
+                if value:
+                    return str(value)
         except Exception:
             continue
 

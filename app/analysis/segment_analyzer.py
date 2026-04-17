@@ -279,6 +279,34 @@ class SegmentAnalyzer:
                 calculated_at=datetime.datetime.now(datetime.timezone.utc),
             )
 
+        # IQR фильтрация выбросов
+        if len(prices) >= 4:
+            prices_arr_iqr = np.array(prices, dtype=np.float64)
+            q1 = float(np.percentile(prices_arr_iqr, 25))
+            q3 = float(np.percentile(prices_arr_iqr, 75))
+            iqr = q3 - q1
+            lower_fence = q1 - 1.5 * iqr
+            upper_fence = q3 + 1.5 * iqr
+            filtered = prices_arr_iqr[
+                (prices_arr_iqr >= lower_fence) & (prices_arr_iqr <= upper_fence)
+            ]
+            if len(filtered) >= 3:
+                self._log.debug(
+                    "iqr_filter_applied",
+                    segment=segment_key.to_string(),
+                    before=len(prices),
+                    after=len(filtered),
+                    lower_fence=lower_fence,
+                    upper_fence=upper_fence,
+                )
+                prices = filtered.tolist()
+            else:
+                self._log.debug(
+                    "iqr_filter_skipped_too_few_remaining",
+                    segment=segment_key.to_string(),
+                    filtered_count=len(filtered),
+                )
+
         prices_arr = np.array(prices, dtype=np.float64)
 
         median_price = float(np.median(prices_arr))
@@ -770,7 +798,11 @@ class SegmentAnalyzer:
                 )
 
                 # Собираем dict для анализа
+                # Извлекаем категорию из segment_key (первая часть до '|')
+                _category = segment_key_str.split('|')[0] if segment_key_str else 'unknown'
+
                 stats_dict: dict[str, Any] = {
+                    'category': _category,
                     'sample_size': stats_obj.sample_size or 0,
                     'listing_count': stats_obj.listing_count or 0,
                     'median_price': stats_obj.listing_price_median,

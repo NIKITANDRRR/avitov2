@@ -193,6 +193,18 @@ def run_once(
     asyncio.run(_run_once(force=force))
 
 
+@app.command("force-parse")
+def force_parse() -> None:
+    """Принудительный парсинг: товары сразу, затем категории по очереди."""
+    asyncio.run(_force_parse())
+
+
+@app.command("force-pending")
+def force_pending() -> None:
+    """Принудительная дообработка pending объявлений (браузер видимый для ввода капчи)."""
+    asyncio.run(_force_pending())
+
+
 # ------------------------------------------------------------------
 # Служебные команды
 # ------------------------------------------------------------------
@@ -324,6 +336,81 @@ async def _run_once(force: bool = True) -> None:
         )
 
     if stats["errors"] > 0:
+        raise typer.Exit(code=1)
+
+
+async def _force_parse() -> None:
+    """Асинхронная реализация force-parse.
+
+    Сначала парсит все товарные поиски одновременно,
+    затем — категории по очереди с интервалом.
+    """
+    from app.scheduler.pipeline import Pipeline
+    from app.utils import setup_logging
+    from app.config import get_settings
+
+    settings = get_settings()
+    setup_logging(settings.LOG_LEVEL)
+
+    logger = structlog.get_logger("cli")
+    logger.info("starting_force_parse")
+
+    typer.echo("[..] Запуск принудительного парсинга (force-parse)...")
+
+    pipeline = Pipeline(settings)
+    try:
+        stats = await pipeline.run_force_parse_cycle()
+
+        if stats.get("status") == "no_searches":
+            typer.echo("[INFO] Нет активных поисков для принудительного парсинга.")
+            return
+
+        typer.echo(
+            f"[OK] Принудительный парсинг завершён: "
+            f"товаров обработано={stats.get('products_parsed', 0)}, "
+            f"категорий обработано={stats.get('categories_parsed', 0)}"
+        )
+    except Exception as exc:
+        typer.echo(f"❌ Ошибка: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+
+async def _force_pending() -> None:
+    """Асинхронная реализация force-pending.
+
+    Обходит все объявления в статусе pending и пытается их спарсить.
+    Браузер запускается в видимом режиме для ручного ввода капчи.
+    """
+    from app.scheduler.pipeline import Pipeline
+    from app.utils import setup_logging
+    from app.config import get_settings
+
+    settings = get_settings()
+    setup_logging(settings.LOG_LEVEL)
+
+    logger = structlog.get_logger("cli")
+    logger.info("starting_force_pending")
+
+    typer.echo("[..] Запуск дообработки pending объявлений (force-pending)...")
+    typer.echo("    Браузер будет открыт в видимом режиме — для ввода капчи.")
+
+    pipeline = Pipeline(settings)
+    try:
+        stats = await pipeline.run_force_pending_cycle()
+
+        if stats["pending_processed"] == 0:
+            typer.echo("[INFO] Нет pending объявлений для дообработки.")
+            return
+
+        typer.echo(
+            f"[OK] Дообработка завершена: "
+            f"обработано={stats['pending_processed']}, "
+            f"успешно={stats['pending_success']}, "
+            f"ошибок={stats['pending_failed']}, "
+            f"капча={stats['captcha_encountered']}"
+        )
+    except Exception as exc:
+        typer.echo(f"❌ Ошибка: {exc}", err=True)
         raise typer.Exit(code=1)
 
 

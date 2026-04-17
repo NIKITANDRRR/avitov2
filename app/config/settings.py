@@ -185,6 +185,7 @@ class Settings(BaseSettings):
             "наушник", "airpods pro",
             "аккумулятор", "battery",
             "винт", "болт", "креплени",
+            "комплект", "набор", "bundle", "лот", "штук", "пара", "набором", "комплектом",
         ],
         description="Чёрный список слов в названии для фильтрации аксессуаров"
     )
@@ -287,6 +288,40 @@ class Settings(BaseSettings):
         description="Максимум запросов карточек в минуту",
     )
 
+    # --- Seller Profile Parsing ---
+    SELLER_PROFILE_ENABLED: bool = Field(
+        default=True,
+        description="Включить/выключить парсинг профилей продавцов",
+    )
+    SELLER_RATE_LIMIT_PER_MINUTE: int = Field(
+        default=3,
+        ge=1,
+        le=30,
+        description="Rate limit для запросов к профилям (запросов/мин)",
+    )
+    SELLER_MAX_PROFILES_PER_CYCLE: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Макс. кол-во профилей за один цикл",
+    )
+    SELLER_SCRAPE_INTERVAL_HOURS: float = Field(
+        default=24.0,
+        ge=1.0,
+        le=168.0,
+        description="Интервал повторного парсинга профиля (часы)",
+    )
+    SELLER_PAGE_DELAY_MIN: float = Field(
+        default=5.0,
+        ge=1.0,
+        description="Мин. задержка между страницами профиля (сек)",
+    )
+    SELLER_PAGE_DELAY_MAX: float = Field(
+        default=12.0,
+        ge=1.0,
+        description="Макс. задержка между страницами профиля (сек)",
+    )
+
     # === Настройки retry ===
     RETRY_MAX_ATTEMPTS: int = Field(
         default=3,
@@ -309,6 +344,18 @@ class Settings(BaseSettings):
     USE_ISOLATED_CONTEXTS: bool = Field(
         default=True,
         description="Создавать отдельный контекст браузера на каждый поиск",
+    )
+
+    # === Force parse mode settings ===
+    FORCE_PARSE_PRODUCT_DELAY_SECONDS: int = Field(
+        default=60,
+        ge=0,
+        description="Задержка после парсинга товаров перед категориями (сек)",
+    )
+    FORCE_PARSE_CATEGORY_INTERVAL_SECONDS: int = Field(
+        default=60,
+        ge=0,
+        description="Интервал между категориями при force-parse (сек)",
     )
 
     # --- Segment Analysis Settings ---

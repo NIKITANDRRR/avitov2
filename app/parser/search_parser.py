@@ -9,7 +9,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from app.utils.exceptions import ParserError
-from app.utils.helpers import extract_ad_id_from_url, normalize_url
+from app.utils.helpers import extract_ad_id_from_url, normalize_url, normalize_price
 
 log = structlog.get_logger()
 
@@ -23,6 +23,7 @@ class SearchResultItem:
         url: Полный URL объявления.
         title: Заголовок объявления.
         price_str: Сырая строка цены.
+        price: Числовая цена (нормализованная) или None.
         location: Местоположение / адрес.
         metadata: Дополнительные данные парсинга.
     """
@@ -33,6 +34,12 @@ class SearchResultItem:
     price_str: str | None
     location: str | None
     metadata: dict = field(default_factory=dict)
+    price: float | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        """Вычисляет числовую цену из строки."""
+        if self.price_str is not None:
+            self.price = normalize_price(self.price_str)
 
 
 def parse_search_page(html: str, search_url: str) -> list[SearchResultItem]:

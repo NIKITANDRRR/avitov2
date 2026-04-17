@@ -1,5 +1,43 @@
 # Release Notes — Avito Price Monitor
 
+## [2026-04-17] — Улучшения парсинга и режим force-pending
+
+### Новое
+- **QW-2: Сохранение цены из поисковой выдачи** — цена и заголовок теперь сохраняются при первом обнаружении объявления в поисковой выдаче, до парсинга карточки
+  - [`SearchResultItem`](app/parser/search_parser.py:18) — добавлено вычисляемое поле `price` (нормализованное из `price_str`)
+  - [`batch_get_or_create_ads()`](app/storage/repository.py:354) — принимает `title` и `price` из поисковых результатов
+  - [`_process_search()`](app/scheduler/pipeline.py) — передаёт `item.title` и `item.price` при создании Ad
+- **P1-1: Извлечение seller_type из карточки** — определение типа продавца (частный, компания, магазин)
+  - Поле [`seller_type`](app/parser/ad_parser.py:47) добавлено в `AdData`
+  - Функция [`_extract_seller_type()`](app/parser/ad_parser.py:432) — извлечение из HTML-блока продавца
+  - Функция [`_extract_seller_data_from_next_data()`](app/parser/ad_parser.py:281) — fallback через `__NEXT_DATA__` (React/Next)
+  - Функция [`_extract_seller_type_from_json()`](app/parser/ad_parser.py:369) — рекурсивный поиск в JSON-структуре
+- **Force-pending: режим дообработки pending объявлений** — новая команда для повторной обработки объявлений, карточки которых не были спарсены
+  - Команда [`force-pending`](app/scheduler/cli.py:202) — CLI-точка входа
+  - Метод [`run_force_pending_cycle()`](app/scheduler/pipeline.py:535) — основная логика: загрузка, детекция капчи, парсинг, обновление
+  - Метод [`_detect_captcha()`](app/collector/collector.py:439) — обнаружение Cloudflare, reCAPTCHA, hCaptcha, Bitrix CAPTCHA
+  - Метод [`get_pending_ads()`](app/storage/repository.py:250) — запрос объявлений со статусом `parse_status='pending'`
+  - Браузер запускается в видимом режиме (`headless=False`) для ручного ввода капчи
+  - Ожидание ввода капчи — до 120 секунд, до 3 попыток на объявление
+  - Паузы: 3–8 сек между объявлениями, 15–25 сек каждые 5 объявлений
+
+### Изменения
+- **P0-2: Валидация цены при создании Ad** — отрицательные цены обнуляются (`None`) в [`batch_get_or_create_ads()`](app/storage/repository.py:398)
+
+### Документация
+- Добавлен [`docs/fix_plan.md`](docs/fix_plan.md) — анализ проблем и план исправлений
+
+### Изменённые файлы
+- `app/parser/search_parser.py` — поле `price` в `SearchResultItem`, автонормализация
+- `app/parser/ad_parser.py` — поле `seller_type`, расширенные селекторы, fallback `__NEXT_DATA__`
+- `app/collector/collector.py` — метод `_detect_captcha()`
+- `app/storage/repository.py` — метод `get_pending_ads()`, `title`/`price` в `batch_get_or_create_ads()`
+- `app/scheduler/pipeline.py` — метод `run_force_pending_cycle()`, передача `title`/`price` из поиска
+- `app/scheduler/cli.py` — команда `force-pending`
+- `docs/fix_plan.md` — новый файл
+
+---
+
 ## [2026-04-17] — Парсинг проданных товаров продавцов
 
 ### Новое

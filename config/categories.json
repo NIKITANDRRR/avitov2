@@ -6,7 +6,7 @@
       "category": "телевизоры",
       "location": "челябинск",
       "owner_type": "частное",
-      "schedule_interval_hours": 3,
+      "schedule_interval_hours": 2,
       "max_ads_to_parse": 20,
       "priority": 8
     },
@@ -16,7 +16,7 @@
       "category": "велосипеды",
       "location": "челябинск",
       "owner_type": "частное",
-      "schedule_interval_hours": 4,
+      "schedule_interval_hours": 5,
       "max_ads_to_parse": 20,
       "priority": 7
     },
@@ -26,7 +26,7 @@
       "category": "саундбары",
       "location": "челябинск",
       "owner_type": "частное",
-      "schedule_interval_hours": 3,
+      "schedule_interval_hours": 4,
       "max_ads_to_parse": 20,
       "priority": 8
     },
@@ -36,7 +36,7 @@
       "category": "тв приставки",
       "location": "россия",
       "min_price": 10000,
-      "schedule_interval_hours": 2,
+      "schedule_interval_hours": 3,
       "max_ads_to_parse": 20,
       "priority": 10
     }

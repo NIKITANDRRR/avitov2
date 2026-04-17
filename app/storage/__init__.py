@@ -10,6 +10,8 @@ from app.storage.models import (
     SearchRun,
     SegmentPriceHistory,
     SegmentStats,
+    Seller,
+    SoldItem,
     TrackedSearch,
 )
 from app.storage.repository import Repository
@@ -25,6 +27,8 @@ __all__ = [
     "SearchRun",
     "SegmentPriceHistory",
     "SegmentStats",
+    "Seller",
+    "SoldItem",
     "TrackedSearch",
     "Repository",
 ]

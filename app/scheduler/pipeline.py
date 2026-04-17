@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+import numpy as np
 import psutil
 import structlog
 
@@ -16,6 +17,7 @@ from app.config import get_settings
 from app.config.settings import Settings
 from app.collector import BrowserManager, AvitoCollector
 from app.parser import parse_search_page, parse_ad_page, SearchResultItem, AdData
+from app.parser.seller_parser import parse_seller_profile, SellerProfileData, SoldItemData
 from app.storage import Repository, get_session
 from app.storage.models import TrackedSearch
 from app.analysis import PriceAnalyzer, UndervaluedAd, AdAnalysisResult, MarketStats
@@ -294,6 +296,10 @@ class Pipeline:
                 max_requests=self.settings.AD_RATE_LIMIT_PER_MINUTE,
                 per_seconds=60,
             )
+            seller_rate_limiter = RateLimiter(
+                max_requests=self.settings.SELLER_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
             # Общий rate_limiter для обратной совместимости (legacy run)
             rate_limiter = RateLimiter(
                 max_requests=self.settings.REQUEST_RATE_LIMIT_PER_MINUTE,
@@ -304,6 +310,7 @@ class Pipeline:
                 rate_limiter=rate_limiter,
                 search_rate_limiter=search_rate_limiter,
                 ad_rate_limiter=ad_rate_limiter,
+                seller_rate_limiter=seller_rate_limiter,
             )
 
             try:
@@ -354,7 +361,7 @@ class Pipeline:
 
                 # --- Анализ и уведомления для всех поисков ---
                 self.logger.info(
-                    "DEBUG_about_to_call_analyze_and_notify",
+                    "analyze_and_notify_starting",
                     searches_count=len(due_searches),
                     searches_processed=self.stats["searches_processed"],
                     ads_found=self.stats["ads_found"],
@@ -365,10 +372,25 @@ class Pipeline:
                     repo, due_searches, analyzer,
                 )
                 self.logger.info(
-                    "DEBUG_analyze_and_notify_completed",
+                    "analyze_and_notify_completed",
                     ads_undervalued=self.stats["ads_undervalued"],
                     notifications_sent=self.stats["notifications_sent"],
                 )
+
+                # --- Seller Profile Collection ---
+                try:
+                    sellers_processed = await self._collect_seller_profiles(collector, repo)
+                    if sellers_processed > 0:
+                        self.logger.info(
+                            "seller_profiles_collected",
+                            sellers_processed=sellers_processed,
+                        )
+                except Exception as e:
+                    self.logger.error(
+                        "seller_profile_collection_error",
+                        error=str(e),
+                        exc_info=True,
+                    )
 
                 # Фиксация транзакции
                 repo.commit()
@@ -408,6 +430,310 @@ class Pipeline:
             **self.stats,
         )
         return self.stats
+
+    async def run_force_parse_cycle(self) -> dict:
+        """Принудительный запуск парсинга: сначала все товары, затем категории по очереди.
+
+        Алгоритм:
+            1. Получить все активные поиски из БД.
+            2. Разделить на товарные (``is_category_search=False``)
+               и категорийные (``is_category_search=True``).
+            3. Запустить парсинг всех товарных поисков одновременно
+               через ``run_search_cycle()``.
+            4. Ждать ``FORCE_PARSE_PRODUCT_DELAY_SECONDS`` секунд.
+            5. Парсить категории по очереди с интервалом
+               ``FORCE_PARSE_CATEGORY_INTERVAL_SECONDS`` между ними.
+
+        Returns:
+            dict: Статистика ``{"products_parsed": int, "categories_parsed": int}``.
+        """
+        self.logger.info("force_parse_starting")
+
+        # 1. Получить все активные поиски
+        session = get_session()
+        repo = Repository(session)
+        try:
+            all_searches = repo.get_active_searches()
+        finally:
+            repo.close()
+
+        if not all_searches:
+            self.logger.warning("force_parse_no_searches")
+            return {"status": "no_searches", "products_parsed": 0, "categories_parsed": 0}
+
+        # 2. Разделить на товары и категории
+        product_searches = [s for s in all_searches if not s.is_category_search]
+        category_searches = [s for s in all_searches if s.is_category_search]
+
+        self.logger.info(
+            "force_parse_searches_found",
+            products=len(product_searches),
+            categories=len(category_searches),
+        )
+
+        total_stats: dict[str, int] = {"products_parsed": 0, "categories_parsed": 0}
+
+        # 3. Парсим все товары сразу
+        if product_searches:
+            self.logger.info("force_parse_products_start", count=len(product_searches))
+            try:
+                stats = await self.run_search_cycle(searches=product_searches)
+                total_stats["products_parsed"] = stats.get("ads_found", 0) if stats else 0
+                self.logger.info(
+                    "force_parse_products_done",
+                    ads_found=total_stats["products_parsed"],
+                )
+            except Exception as e:
+                self.logger.error("force_parse_products_error", error=str(e))
+
+        # 4. Ждём перед категориями
+        if category_searches:
+            delay = self.settings.FORCE_PARSE_PRODUCT_DELAY_SECONDS
+            self.logger.info("force_parse_delay_before_categories", seconds=delay)
+            await asyncio.sleep(delay)
+
+            # 5. Парсим категории по очереди
+            interval = self.settings.FORCE_PARSE_CATEGORY_INTERVAL_SECONDS
+            for i, category in enumerate(category_searches):
+                self.logger.info(
+                    "force_parse_category_start",
+                    index=i + 1,
+                    total=len(category_searches),
+                    query=category.search_phrase or category.search_url,
+                )
+                try:
+                    stats = await self.run_search_cycle(searches=[category])
+                    ads_count = stats.get("ads_found", 0) if stats else 0
+                    total_stats["categories_parsed"] += 1
+                    self.logger.info(
+                        "force_parse_category_done",
+                        query=category.search_phrase or category.search_url,
+                        ads_found=ads_count,
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        "force_parse_category_error",
+                        query=category.search_phrase or category.search_url,
+                        error=str(e),
+                    )
+
+                # Интервал между категориями (кроме последней)
+                if i < len(category_searches) - 1:
+                    self.logger.info(
+                        "force_parse_category_interval",
+                        seconds=interval,
+                    )
+                    await asyncio.sleep(interval)
+
+        self.logger.info(
+            "force_parse_completed",
+            products_parsed=total_stats["products_parsed"],
+            categories_parsed=total_stats["categories_parsed"],
+        )
+        return total_stats
+
+    async def run_force_pending_cycle(self) -> dict[str, int]:
+        """Принудительная дообработка всех pending объявлений.
+
+        Алгоритм:
+            1. Получить все объявления со статусом ``parse_status='pending'``.
+            2. Запустить браузер (``headless=False`` — чтобы пользователь
+               мог ввести капчу вручную).
+            3. Для каждого pending объявления:
+               a. Открыть карточку.
+               b. Если обнаружена капча — ждать до 120 секунд
+                  (пользователь вводит вручную).
+               c. После прохождения капчи — повторить попытку (до 3 раз).
+               d. Спарсить данные, обновить запись.
+            4. Вернуть статистику.
+
+        Returns:
+            dict[str, int]: Статистика с ключами
+            ``pending_processed``, ``pending_success``, ``pending_failed``,
+            ``captcha_encountered``.
+        """
+        self.logger.info("force_pending_starting")
+
+        # 1. Получить все pending объявления
+        session = get_session()
+        repo = Repository(session)
+        try:
+            pending_ads = repo.get_pending_ads()
+        finally:
+            repo.close()
+
+        if not pending_ads:
+            self.logger.info("force_pending_no_ads")
+            return {
+                "pending_processed": 0,
+                "pending_success": 0,
+                "pending_failed": 0,
+                "captcha_encountered": 0,
+            }
+
+        self.logger.info(
+            "force_pending_ads_found",
+            count=len(pending_ads),
+        )
+
+        stats: dict[str, int] = {
+            "pending_processed": 0,
+            "pending_success": 0,
+            "pending_failed": 0,
+            "captcha_encountered": 0,
+        }
+
+        # 2. Запустить браузер headless=False
+        browser = BrowserManager(headless=False)
+        await browser.start()
+
+        collector = AvitoCollector(
+            browser_manager=browser,
+            settings=self.settings,
+        )
+
+        try:
+            for idx, ad in enumerate(pending_ads, start=1):
+                self.logger.info(
+                    "force_pending_processing",
+                    index=idx,
+                    total=len(pending_ads),
+                    ad_id=ad.ad_id,
+                    url=ad.url,
+                )
+
+                success = False
+                captcha_detected = False
+
+                for attempt in range(1, 4):  # до 3 попыток
+                    try:
+                        # Сбор карточки
+                        html, html_path = await collector.collect_ad_page(ad.url)
+
+                        # Проверка капчи
+                        if collector._detect_captcha(html):
+                            captcha_detected = True
+                            stats["captcha_encountered"] += 1
+                            self.logger.warning(
+                                "CAPTCHA_DETECTED",
+                                ad_id=ad.ad_id,
+                                attempt=attempt,
+                                msg="waiting for manual input (120s)...",
+                            )
+                            # Ждём 120 секунд — пользователь вводит капчу
+                            await asyncio.sleep(120)
+
+                            # Повторная загрузка страницы после ввода капчи
+                            html, html_path = await collector.collect_ad_page(ad.url)
+
+                            # Снова проверяем
+                            if collector._detect_captcha(html):
+                                self.logger.warning(
+                                    "CAPTCHA_STILL_PRESENT",
+                                    ad_id=ad.ad_id,
+                                    attempt=attempt,
+                                )
+                                continue  # следующая попытка
+
+                        # Парсинг данных
+                        ad_data: AdData = parse_ad_page(html, ad.url)
+
+                        # Обновление записи в БД
+                        session = get_session()
+                        repo = Repository(session)
+                        try:
+                            repo.update_ad(
+                                ad.ad_id,
+                                title=ad_data.title,
+                                price=ad_data.price,
+                                location=ad_data.location,
+                                seller_name=ad_data.seller_name,
+                                seller_type=ad_data.seller_type,
+                                condition=ad_data.condition,
+                                publication_date=ad_data.publication_date,
+                                parse_status="parsed",
+                                last_error=None,
+                            )
+                            repo.commit()
+                        except Exception as db_exc:
+                            self.logger.error(
+                                "force_pending_db_update_failed",
+                                ad_id=ad.ad_id,
+                                error=str(db_exc),
+                            )
+                        finally:
+                            repo.close()
+
+                        success = True
+                        stats["pending_success"] += 1
+                        self.logger.info(
+                            "force_pending_ad_success",
+                            ad_id=ad.ad_id,
+                            title=ad_data.title,
+                            price=ad_data.price,
+                            attempt=attempt,
+                        )
+                        break  # выходим из цикла попыток
+
+                    except Exception as exc:
+                        self.logger.warning(
+                            "force_pending_attempt_failed",
+                            ad_id=ad.ad_id,
+                            attempt=attempt,
+                            error=str(exc),
+                        )
+
+                if not success:
+                    stats["pending_failed"] += 1
+                    self.logger.error(
+                        "force_pending_ad_failed",
+                        ad_id=ad.ad_id,
+                        url=ad.url,
+                    )
+                    # Пометить как failed
+                    try:
+                        session = get_session()
+                        repo = Repository(session)
+                        repo.update_ad(
+                            ad.ad_id,
+                            parse_status="failed",
+                            last_error="captcha_not_passed",
+                        )
+                        repo.commit()
+                    except Exception as db_exc:
+                        self.logger.error(
+                            "force_pending_status_update_failed",
+                            ad_id=ad.ad_id,
+                            error=str(db_exc),
+                        )
+                    finally:
+                        repo.close()
+
+                stats["pending_processed"] += 1
+
+                # Задержка между объявлениями: 3-8 секунд
+                delay = random.uniform(3, 8)
+                await asyncio.sleep(delay)
+
+                # Пауза между группами по 5 объявлений: 15-25 секунд
+                if idx % 5 == 0 and idx < len(pending_ads):
+                    group_delay = random.uniform(15, 25)
+                    self.logger.info(
+                        "force_pending_group_pause",
+                        processed=idx,
+                        total=len(pending_ads),
+                        pause_sec=round(group_delay, 1),
+                    )
+                    await asyncio.sleep(group_delay)
+
+        finally:
+            await collector.close()
+
+        self.logger.info(
+            "force_pending_completed",
+            **stats,
+        )
+        return stats
 
     # ------------------------------------------------------------------
     # Внутренние методы
@@ -593,6 +919,11 @@ class Pipeline:
                     except Exception as exc:
                         run_errors_counter[0] += 1
                         self.stats["errors"] += 1
+                        if not repo.session.is_active:
+                            try:
+                                repo.session.rollback()
+                            except Exception:
+                                pass
                         self.logger.error(
                             "ad_processing_failed",
                             url=item.url,
@@ -678,6 +1009,8 @@ class Pipeline:
                             "ad_id": ad_id,
                             "url": normalize_url(item.url),
                             "search_url": search_url,
+                            "title": item.title,
+                            "price": item.price,
                         })
 
                 if batch_items:
@@ -879,6 +1212,7 @@ class Pipeline:
                 price=ad_data.price,
                 location=ad_data.location,
                 seller_name=ad_data.seller_name,
+                seller_type=ad_data.seller_type,
                 condition=ad_data.condition,
                 publication_date=ad_data.publication_date,
                 parse_status="parsed",
@@ -888,6 +1222,26 @@ class Pipeline:
             ad_record, _ = repo.get_or_create_ad(
                 ad_id, normalized_url, search_url,
             )
+
+            # --- Привязка объявления к продавцу ---
+            if ad_data.seller_id is not None:
+                try:
+                    seller = repo.get_or_create_seller(
+                        seller_id=ad_data.seller_id,
+                        seller_url=ad_data.seller_url,
+                        seller_name=ad_data.seller_name,
+                    )
+                    repo.link_ad_to_seller(
+                        ad_db_id=ad_record.id,
+                        seller_id_fk=seller.id,
+                    )
+                except Exception as seller_exc:
+                    self.logger.warning(
+                        "seller_link_failed",
+                        ad_id=ad_id,
+                        seller_id=ad_data.seller_id,
+                        error=str(seller_exc),
+                    )
 
             # --- Трекинг оборачиваемости: обновить last_seen_at ---
             try:
@@ -951,6 +1305,149 @@ class Pipeline:
                     error=str(update_exc),
                 )
             return None
+
+    async def _collect_seller_profiles(
+        self,
+        collector: AvitoCollector,
+        repo: Repository,
+    ) -> int:
+        """Собирает данные о профилях продавцов (проданные товары).
+
+        Вызывается после обработки всех объявлений в цикле.
+        Получает продавцов, которых нужно парсить, и собирает их профили.
+        Использует переданный репозиторий для обеспечения атомарности
+        транзакции вместе с основным циклом.
+
+        Args:
+            collector: Экземпляр сборщика.
+            repo: Репозиторий текущей транзакции.
+
+        Returns:
+            Количество обработанных профилей продавцов.
+        """
+        settings = self.settings
+
+        if not settings.SELLER_PROFILE_ENABLED:
+            return 0
+
+        sellers = repo.get_sellers_due_for_scrape(
+            limit=settings.SELLER_MAX_PROFILES_PER_CYCLE,
+            interval_hours=settings.SELLER_SCRAPE_INTERVAL_HOURS,
+        )
+
+        if not sellers:
+            self.logger.info("no_sellers_due_for_scrape")
+            return 0
+
+        self.logger.info(
+            "sellers_due_for_scrape",
+            count=len(sellers),
+        )
+
+        processed = 0
+
+        for seller in sellers:
+            self.logger.info(
+                "collecting_seller_profile",
+                seller_id=seller.seller_id,
+            )
+
+            # Пропуск продавцов без URL профиля
+            if not seller.seller_url:
+                self.logger.warning(
+                    "seller_url_missing",
+                    seller_id=seller.seller_id,
+                )
+                continue
+
+            try:
+                html, final_url = await collector.collect_seller_page(
+                    seller.seller_url, tab="sold",
+                )
+
+                if html is not None:
+                    profile: SellerProfileData = parse_seller_profile(
+                        html, url=final_url or seller.seller_url,
+                    )
+
+                    repo.update_seller(
+                        seller.seller_id,
+                        seller_name=profile.seller_name,
+                        rating=profile.rating,
+                        reviews_count=profile.reviews_count,
+                        total_sold_items=profile.total_sold_items,
+                        last_scraped_at=datetime.now(timezone.utc),
+                        scrape_status="scraped",
+                    )
+
+                    if profile.sold_items:
+                        items_dicts = [
+                            {
+                                "item_id": item.item_id,
+                                "title": item.title,
+                                "price": item.price,
+                                "price_str": item.price_str,
+                                "category": item.category,
+                                "sold_date": item.sold_date,
+                                "item_url": item.item_url,
+                            }
+                            for item in profile.sold_items
+                        ]
+                        saved = repo.save_sold_items(
+                            seller_db_id=seller.id,
+                            items=items_dicts,
+                        )
+                        self.logger.info(
+                            "seller_profile_scraped",
+                            seller_id=seller.seller_id,
+                            sold_items_count=len(profile.sold_items),
+                            sold_items_saved=saved,
+                        )
+                    else:
+                        self.logger.info(
+                            "seller_profile_scraped_no_sold_items",
+                            seller_id=seller.seller_id,
+                        )
+                else:
+                    self.logger.warning(
+                        "seller_page_html_empty",
+                        seller_id=seller.seller_id,
+                    )
+                    repo.update_seller(
+                        seller.seller_id,
+                        scrape_status="failed",
+                    )
+
+            except Exception as exc:
+                self.logger.error(
+                    "seller_profile_failed",
+                    seller_id=seller.seller_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                try:
+                    repo.update_seller(
+                        seller.seller_id,
+                        scrape_status="failed",
+                    )
+                except Exception as update_exc:
+                    self.logger.error(
+                        "seller_status_update_failed",
+                        seller_id=seller.seller_id,
+                        error=str(update_exc),
+                    )
+
+            processed += 1
+
+            # Задержка между профилями продавцов
+            await asyncio.sleep(
+                random.uniform(
+                    settings.SELLER_PAGE_DELAY_MIN,
+                    settings.SELLER_PAGE_DELAY_MAX,
+                )
+            )
+
+        return processed
 
     async def _analyze_and_notify(self, repo: Repository) -> None:
         """Анализ цен и отправка уведомлений (legacy-режим).
@@ -1334,21 +1831,62 @@ class Pipeline:
             )
             return []
 
-        # 2. Фильтрация аксессуаров
+        # 2. Фильтрация аксессуаров (двухпроходная схема)
         accessory_filter = AccessoryFilter(
             blacklist=self.settings.ACCESSORY_BLACKLIST,
             min_price=self.settings.MIN_PRICE_FILTER,
             price_ratio=self.settings.ACCESSORY_PRICE_RATIO_THRESHOLD,
             enabled=self.settings.ENABLE_ACCESSORY_FILTER,
         )
-        filtered_ads = []
+
+        # Проход 1: фильтрация по blacklist, min_price и bundle (без медианы)
+        pass1_ads = []
         for ad in ads:
             if ad.price is None or ad.price <= 0:
                 continue
             filter_result = accessory_filter.is_accessory(ad, median_price=None)
             if filter_result.is_filtered:
                 continue
-            filtered_ads.append(ad)
+            pass1_ads.append(ad)
+
+        if not pass1_ads:
+            self.logger.info(
+                "category_search_all_filtered_pass1",
+                search_id=search.id,
+            )
+            return []
+
+        # Рассчитываем предварительную медиану по результатам прохода 1
+        _prelim_prices = [ad.price for ad in pass1_ads if ad.price]
+        _prelim_median = float(np.median(_prelim_prices)) if _prelim_prices else None
+
+        # Проход 2: фильтрация по price_ratio с предварительной медианой
+        if _prelim_median is not None and _prelim_median > 0:
+            filtered_ads = []
+            for ad in pass1_ads:
+                filter_result = accessory_filter.is_accessory(ad, median_price=_prelim_median)
+                if filter_result.is_filtered:
+                    self.logger.debug(
+                        "category_search_pass2_filtered",
+                        ad_id=ad.ad_id,
+                        title=ad.title,
+                        price=ad.price,
+                        prelim_median=_prelim_median,
+                        reason=filter_result.reason,
+                    )
+                    continue
+                filtered_ads.append(ad)
+
+            self.logger.info(
+                "category_search_two_pass_filter",
+                search_id=search.id,
+                total_ads=len(ads),
+                pass1_ads=len(pass1_ads),
+                pass2_ads=len(filtered_ads),
+                prelim_median=_prelim_median,
+            )
+        else:
+            filtered_ads = pass1_ads
 
         if not filtered_ads:
             self.logger.info(

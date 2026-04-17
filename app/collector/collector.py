@@ -45,6 +45,13 @@ class AvitoCollector:
         "h1",
     ]
 
+    # Селекторы ожидания для профиля продавца
+    _SELLER_SELECTORS: list[str] = [
+        '[data-marker="profile/name"]',
+        ".seller-name",
+        "h1",
+    ]
+
     def __init__(
         self,
         browser_manager: BrowserManager,
@@ -52,12 +59,14 @@ class AvitoCollector:
         rate_limiter: RateLimiter | None = None,
         search_rate_limiter: RateLimiter | None = None,
         ad_rate_limiter: RateLimiter | None = None,
+        seller_rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.browser = browser_manager
         self.settings = settings
         self._rate_limiter = rate_limiter
         self._search_rate_limiter = search_rate_limiter
         self._ad_rate_limiter = ad_rate_limiter
+        self._seller_rate_limiter = seller_rate_limiter
         self.logger = structlog.get_logger()
 
     async def _navigate_with_retry(
@@ -309,6 +318,148 @@ class AvitoCollector:
                 await page.close()
             except Exception as exc:
                 self.logger.debug("page_close_failed", error=str(exc))
+
+    async def collect_seller_page(
+        self,
+        seller_url: str,
+        tab: str = "sold",
+        context: "BrowserContext | None" = None,
+    ) -> tuple[str | None, str | None]:
+        """Загрузить страницу профиля продавца и вернуть ``(html, final_url)``.
+
+        Выполняет случайную задержку перед открытием, загружает страницу
+        профиля продавца (с указанной вкладкой), ожидает появления контента,
+        имитирует скролл и возвращает HTML и итоговый URL.
+
+        Args:
+            seller_url: URL профиля продавца на Avito.
+            tab: Вкладка профиля (``'sold'`` для проданных товаров).
+            context: Опциональный изолированный контекст браузера.
+                Если передан — страница создаётся из него.
+
+        Returns:
+            tuple[str | None, str | None]: Кортеж ``(html_content, final_url)``.
+                Возвращает ``(None, None)`` при ошибке.
+
+        Raises:
+            CollectorError: Если не удалось загрузить страницу.
+        """
+        # Формируем итоговый URL с вкладкой
+        target_url = seller_url
+        if tab == "sold":
+            separator = "&" if "?" in seller_url else "?"
+            target_url = f"{seller_url}{separator}tab=sold"
+
+        if context is not None:
+            page = await context.new_page()
+        else:
+            page = await self.browser.new_page()
+        try:
+            await random_delay(
+                self.settings.MIN_DELAY_SECONDS,
+                self.settings.MAX_DELAY_SECONDS,
+            )
+
+            self.logger.info("collecting_seller_page", url=target_url)
+
+            # Rate limiter: приоритет раздельному, fallback на общий
+            if self._seller_rate_limiter is not None:
+                await self._seller_rate_limiter.acquire()
+            elif self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
+
+            await self._navigate_with_retry(page, target_url)
+
+            # Ожидание загрузки профиля продавца
+            selector_found = await self._wait_for_selectors(
+                page, self._SELLER_SELECTORS, timeout=15000,
+            )
+            if not selector_found:
+                self.logger.warning(
+                    "seller_selectors_not_found",
+                    url=target_url,
+                    selectors=self._SELLER_SELECTORS,
+                )
+
+            # Имитация скролла для загрузки проданных товаров
+            await page.mouse.wheel(0, random.randint(500, 1200))
+            await random_delay(1.0, 3.0)
+
+            # Дополнительный скролл для подгрузки контента
+            await page.mouse.wheel(0, random.randint(500, 1200))
+            await random_delay(1.0, 2.0)
+
+            html = await page.content()
+            final_url = page.url
+
+            # Сохранение HTML для отладки
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            filename = f"seller_{timestamp}"
+            directory = f"{self.settings.RAW_HTML_PATH}/seller"
+            saved_path = await save_html(html, directory, filename)
+
+            self.logger.info(
+                "seller_page_collected",
+                url=target_url,
+                final_url=final_url,
+                saved_path=saved_path,
+                html_length=len(html),
+            )
+
+            return html, final_url
+
+        except PlaywrightError as exc:
+            self.logger.warning(
+                "seller_page_browser_error",
+                url=target_url,
+                error=str(exc),
+            )
+            raise CollectorError(
+                f"Failed to collect seller page {target_url}: {exc}"
+            ) from exc
+        except Exception as exc:
+            # Пытаемся сохранить HTML для отладки даже при ошибке
+            try:
+                html = await page.content()
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                directory = f"{self.settings.RAW_HTML_PATH}/seller"
+                await save_html(html, directory, f"seller_error_{timestamp}")
+            except Exception as save_exc:
+                self.logger.debug("save_error_html_failed", error=str(save_exc))
+
+            raise CollectorError(
+                f"Failed to collect seller page {target_url}: {exc}"
+            ) from exc
+        finally:
+            try:
+                await page.close()
+            except Exception as exc:
+                self.logger.debug("page_close_failed", error=str(exc))
+
+    def _detect_captcha(self, html: str) -> bool:
+        """Проверить, содержит ли HTML страницу капчи.
+
+        Ищет характерные индикаторы капчи в HTML-контенте:
+        Cloudflare, reCAPTCHA, hCaptcha, Bitrix CAPTCHA и русскоязычные фразы.
+
+        Args:
+            html: HTML-контент страницы.
+
+        Returns:
+            bool: ``True``, если обнаружена страница капчи.
+        """
+        captcha_indicators = [
+            'captcha',
+            'bitrix/tools/captcha',
+            'recaptcha',
+            'hcaptcha',
+            'cloudflare-challenge',
+            'Проверка безопасности',
+            'Подтвердите, что вы не робот',
+            'Докажите, что вы человек',
+        ]
+        html_lower = html.lower()
+        return any(indicator.lower() in html_lower for indicator in captcha_indicators)
 
     async def _wait_for_selectors(
         self,

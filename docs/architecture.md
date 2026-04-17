@@ -1,6 +1,6 @@
 # Архитектура Avito Price Monitor
 
-> **Версия:** 4.0
+> **Версия:** 4.1
 > **Дата:** 2026-04-17
 
 ---
@@ -40,6 +40,7 @@
 | `run-once` | [`run_once()`](app/scheduler/cli.py:185) | Один цикл (по умолч. принудительно — все поиски) |
 | `run` | [`run()`](app/scheduler/cli.py:173) | Legacy: один цикл по SEARCH_URLS из .env |
 | `force-parse` | [`force_parse()`](app/scheduler/cli.py:196) | Принудительный парсинг: товары, затем категории |
+| `force-pending` | [`force_pending()`](app/scheduler/cli.py:202) | Дообработка pending объявлений с ожиданием капчи |
 | `add-search` | [`add_search()`](app/scheduler/cli.py:21) | Добавить поисковый запрос |
 | `list-searches` | [`list_searches()`](app/scheduler/cli.py:103) | Список всех поисков |
 | `remove-search` | [`remove_search()`](app/scheduler/cli.py:69) | Удалить поиск |
@@ -78,6 +79,7 @@
 - [`collect_search_page()`](app/collector/collector.py:46) — загружает поисковую выдачу, имитирует скролл, сохраняет HTML в `data/raw_html/search/`
 - [`collect_ad_page()`](app/collector/collector.py:133) — загружает карточку объявления, сохраняет HTML в `data/raw_html/ad/`
 - [`collect_seller_page()`](app/collector/collector.py) — загружает страницу профиля продавца
+- [`_detect_captcha()`](app/collector/collector.py:439) — проверяет HTML на наличие капчи (Cloudflare, reCAPTCHA, hCaptcha, Bitrix)
 
 ### 2.4 Парсер (Parser)
 
@@ -86,9 +88,14 @@
 - [`app/parser/seller_parser.py`](app/parser/seller_parser.py) — [`parse_seller_profile()`](app/parser/seller_parser.py): парсинг профиля продавца
 
 **Извлекаемые данные:**
-- Поиск: `ad_id`, `url`, `title`, `price_str`, `location`
-- Карточка: `title`, `price`, `location`, `seller_name`, `seller_id`, `seller_url`, `condition`, `publication_date`, `description`
+- Поиск: `ad_id`, `url`, `title`, `price_str`, `price` (нормализованная), `location`
+- Карточка: `title`, `price`, `location`, `seller_name`, `seller_id`, `seller_url`, `seller_type`, `condition`, `publication_date`, `description`
 - Профиль продавца: `seller_id`, `seller_name`, `rating`, `reviews_count`, `total_sold_items`, список проданных товаров
+
+**Fallback-механизмы парсера карточки:**
+- [`seller_type`](app/parser/ad_parser.py:432) — сначала из HTML-блока продавца, затем из `__NEXT_DATA__` (React/Next JSON)
+- [`seller_id`](app/parser/ad_parser.py:148) — из URL профиля (`/user/...`, `/u/...`), fallback из `__NEXT_DATA__`
+- [`seller_url`](app/parser/ad_parser.py:121) — расширенные селекторы + JSON-LD + `__NEXT_DATA__`
 
 ### 2.5 Анализатор (Analysis)
 
@@ -254,14 +261,15 @@ Collector (Playwright/Chromium)
   │                           Сохраняется в data/raw_html/
   ▼
 Parser (BeautifulSoup + lxml)
-  ├── parse_search_page()  → [SearchResultItem]
-  ├── parse_ad_page()      → AdData (title, price, location, seller, ...)
+  ├── parse_search_page()  → [SearchResultItem]  ← title + price сохраняются сразу
+  ├── parse_ad_page()      → AdData (title, price, location, seller, seller_type, ...)
   └── parse_seller_profile() → SellerProfileData + [SoldItemData]
   │
   ▼
 PostgreSQL (SQLAlchemy)
   ├── tracked_searches, search_runs
-  ├── ads, ad_snapshots, notifications_sent
+  ├── ads (title + price из поисковой выдачи, данные карточки при парсинге)
+  ├── ad_snapshots, notifications_sent
   ├── sellers, sold_items
   ├── segment_stats, segment_price_history
   │
@@ -341,6 +349,27 @@ score = 0.4 × IQR_компонент + 0.3 × Z-score_компонент + 0.3 
 - Привязка продавца к объявлению через `seller_id_fk`
 - Ограничения: до 5 профилей за цикл, интервал повторного парсинга 24ч
 
+### 5.6 Режим force-pending
+
+Реализован в [`run_force_pending_cycle()`](app/scheduler/pipeline.py:535).
+
+Предназначен для дообработки объявлений, которые были обнаружены в поисковой выдаче, но карточка не была спарсена (`parse_status='pending'`).
+
+**Алгоритм:**
+
+1. Запрос всех объявлений со статусом `parse_status='pending'` через [`get_pending_ads()`](app/storage/repository.py:250)
+2. Запуск браузера в видимом режиме (`headless=False`) — для ручного ввода капчи
+3. Для каждого pending объявления (до 3 попыток):
+   - Загрузка карточки через [`collect_ad_page()`](app/collector/collector.py:133)
+   - Проверка капчи через [`_detect_captcha()`](app/collector/collector.py:439) — Cloudflare, reCAPTCHA, hCaptcha, Bitrix
+   - При обнаружении капчи — ожидание 120 сек (пользователь вводит вручную)
+   - После прохождения — повторная загрузка и парсинг
+   - Успешно спарсенные обновляются: `parse_status='parsed'`
+   - Неудачные помечаются: `parse_status='failed'`, `last_error='captcha_not_passed'`
+4. Паузы: 3–8 сек между объявлениями, 15–25 сек каждые 5 объявлений
+
+**Запуск:** `python -m app.main force-pending`
+
 ---
 
 ## 6. Конфигурация
@@ -413,6 +442,9 @@ python -m app.main run-once --no-force
 
 # Принудительный парсинг
 python -m app.main force-parse
+
+# Дообработка pending объявлений (браузер видимый для ввода капчи)
+python -m app.main force-pending
 ```
 
 ### Управление поисками

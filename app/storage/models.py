@@ -6,6 +6,7 @@ import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -16,7 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import DynamicMapped, Mapped, mapped_column, relationship
 
 from app.storage.database import Base
 
@@ -196,6 +197,12 @@ class Ad(Base):
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     location: Mapped[str | None] = mapped_column(String(256), nullable=True)
     seller_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    seller_id_fk: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("sellers.id"),
+        nullable=True,
+        index=True,
+    )
     seller_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     condition: Mapped[str | None] = mapped_column(String(128), nullable=True)
     publication_date: Mapped[datetime.datetime | None] = mapped_column(
@@ -227,6 +234,7 @@ class Ad(Base):
     extracted_model: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Relationships
+    seller: Mapped[Seller | None] = relationship("Seller", back_populates="ads")
     snapshots: Mapped[list[AdSnapshot]] = relationship(
         "AdSnapshot",
         back_populates="ad",
@@ -244,6 +252,136 @@ class Ad(Base):
         return (
             f"<Ad id={self.id} ad_id={self.ad_id!r} "
             f"title={self.title!r} parse_status={self.parse_status!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Seller — продавец Avito
+# ---------------------------------------------------------------------------
+
+class Seller(Base):
+    """Профиль продавца Avito.
+
+    Attributes:
+        id: Первичный ключ.
+        seller_id: Строковый ID продавца на Avito (извлечённый из URL).
+        seller_url: URL профиля продавца.
+        seller_name: Имя продавца.
+        rating: Рейтинг продавца.
+        reviews_count: Количество отзывов.
+        total_sold_items: Общее кол-во проданных товаров (с сайта).
+        first_seen_at: Когда впервые обнаружен.
+        last_scraped_at: Когда последний раз парсили профиль.
+        scrape_status: Статус парсинга (pending/scraped/failed).
+        created_at: Дата-время создания записи.
+        updated_at: Дата-время последнего обновления записи.
+        ads: Связанные объявления (one-to-many).
+        sold_items: Связанные проданные товары (one-to-many).
+    """
+
+    __tablename__ = "sellers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    seller_id: Mapped[str] = mapped_column(
+        String(100), unique=True, nullable=False, index=True,
+    )
+    seller_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    seller_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reviews_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_sold_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_seen_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    last_scraped_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    scrape_status: Mapped[str] = mapped_column(String(50), default="pending")
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
+    )
+
+    # Relationships
+    ads: DynamicMapped[Ad] = relationship("Ad", back_populates="seller", lazy="dynamic")
+    sold_items: DynamicMapped[SoldItem] = relationship(
+        "SoldItem",
+        back_populates="seller",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="dynamic",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scrape_status IN ('pending', 'scraped', 'failed')",
+            name="ck_seller_scrape_status",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Seller id={self.id} seller_id={self.seller_id!r} "
+            f"name={self.seller_name!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SoldItem — проданный товар продавца
+# ---------------------------------------------------------------------------
+
+class SoldItem(Base):
+    """Проданный товар продавца Avito.
+
+    Attributes:
+        id: Первичный ключ.
+        seller_id_fk: FK на Seller.
+        item_id: ID товара на Avito (если доступен).
+        title: Название проданного товара.
+        price: Цена продажи.
+        price_str: Сырая строка цены.
+        category: Категория товара.
+        sold_date: Дата продажи (если доступна).
+        item_url: URL товара.
+        scraped_at: Когда спарсено.
+        created_at: Дата-время создания записи.
+        seller: Связанный объект Seller.
+    """
+
+    __tablename__ = "sold_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    seller_id_fk: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("sellers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_str: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sold_date: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    item_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    scraped_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+
+    # Relationships
+    seller: Mapped[Seller] = relationship("Seller", back_populates="sold_items")
+
+    def __repr__(self) -> str:
+        return (
+            f"<SoldItem id={self.id} title={self.title!r} "
+            f"price={self.price}>"
         )
 
 
@@ -376,6 +514,7 @@ class SegmentStats(Base):
     )
     segment_key: Mapped[str] = mapped_column(String, nullable=False)
     segment_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    category: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
 
     # Ценовые метрики
     median_7d: Mapped[float | None] = mapped_column(Float, nullable=True)

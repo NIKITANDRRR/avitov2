@@ -5,9 +5,11 @@
 - Аксессуары (чехлы, кабели, клавиатуры и т.д.)
 - Запчасти (матрицы, шлейфы, аккумуляторы)
 - Мелочёвку с аномально низкой ценой относительно рынка
+- Комплекты/наборы (bundle) — несколько товаров по цене одного
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from app.storage.models import Ad
@@ -60,6 +62,65 @@ class AccessoryFilter:
                 )
         return FilterResult(is_filtered=False)
 
+    def _check_bundle(self, ad: Ad, median_price: float | None = None) -> FilterResult:
+        """Проверка на комплект (bundle) — несколько моделей в одном названии.
+
+        Логика:
+        1. Ищем в названии числовые идентификаторы (2-4 цифры).
+        2. Исключаем числа, которые являются частью спецификаций:
+           - объём памяти: ``256GB``, ``512 ГБ``, ``1TB``
+           - диагональ: ``13.3``, ``15.6`` (дробные)
+           - серия процессора: ``M2``, ``i5``, ``i7``
+           - размеры: ``mm``, ``см``
+        3. Если осталось ≥2 «модельных» чисел И цена ниже медианы — помечаем как bundle.
+        """
+        if not ad.title:
+            return FilterResult(is_filtered=False)
+
+        # Исключаем числа, являющиеся частью спецификаций (GB, TB, ГБ, ТБ, mm, см, M1-M9, i3-i9)
+        title_cleaned = re.sub(
+            r'\b\d{2,4}\s*(?:GB|TB|ГБ|ТБ|gb|tb|мм|mm|см|cm)\b',
+            '', ad.title, flags=re.IGNORECASE,
+        )
+        title_cleaned = re.sub(
+            r'\b(?:M\d|i\d|Ryzen\s*\d)\b',
+            '', title_cleaned, flags=re.IGNORECASE,
+        )
+        # Исключаем дробные числа (диагонали: 13.3, 15.6, 27)
+        title_cleaned = re.sub(r'\b\d+\.\d+\b', '', title_cleaned)
+
+        # Паттерн: два и более чисел (2-4 цифры), разделённых пробелами/дефисами/запятыми
+        numbers = re.findall(r'\b(\d{2,4})\b', title_cleaned)
+        if len(numbers) < 2:
+            return FilterResult(is_filtered=False)
+
+        # Если есть медиана — проверяем, что цена значительно ниже
+        if median_price is not None and median_price > 0 and ad.price is not None:
+            ratio = ad.price / median_price
+            if ratio < self.price_ratio:
+                return FilterResult(
+                    is_filtered=True,
+                    reason=(
+                        f"Bundle: {len(numbers)} числовых моделей в названии "
+                        f"({', '.join(numbers)}), цена {ad.price}₽ = {ratio:.1%} "
+                        f"от медианы {median_price:.0f}₽: {ad.title}"
+                    )
+                )
+
+        # Без медианы — помечаем bundle только если чисел >= 4
+        # (после очистки от спецификаций 3 числа ещё могут быть нормой:
+        #  "MacBook Air 13 2022" → [13, 2022] — 2 числа, норма)
+        if len(numbers) >= 4:
+            return FilterResult(
+                is_filtered=True,
+                reason=(
+                    f"Bundle: {len(numbers)} числовых моделей в названии "
+                    f"({', '.join(numbers)}): {ad.title}"
+                )
+            )
+
+        return FilterResult(is_filtered=False)
+
     def _check_price_ratio(self, ad: Ad, median_price: float | None = None) -> FilterResult:
         """Проверка по соотношению цены к медиане."""
         if median_price is None or median_price <= 0:
@@ -81,12 +142,13 @@ class AccessoryFilter:
         median_price: float | None = None,
     ) -> FilterResult:
         """
-        Проверить, является ли товар аксессуаром/мелочёвкой.
+        Проверить, является ли товар аксессуаром/мелочёвкой/комплектом.
 
-        Применяет последовательно три фильтра:
+        Применяет последовательно четыре фильтра:
         1. Минимальная цена
         2. Чёрный список слов в названии
-        3. Соотношение цены к медиане (если медиана предоставлена)
+        3. Комплект (bundle) — несколько моделей в названии
+        4. Соотношение цены к медиане (если медиана предоставлена)
 
         Returns:
             FilterResult с is_filtered=True если товар следует отфильтровать
@@ -112,7 +174,16 @@ class AccessoryFilter:
             )
             return result
 
-        # Проверка 3: соотношение к медиане (только если медиана предоставлена)
+        # Проверка 3: комплект (bundle) — несколько моделей в названии
+        result = self._check_bundle(ad, median_price)
+        if result.is_filtered:
+            logger.debug(
+                "ad_filtered_bundle",
+                extra={"ad_id": ad.ad_id, "title": ad.title, "reason": result.reason}
+            )
+            return result
+
+        # Проверка 4: соотношение к медиане (только если медиана предоставлена)
         if median_price is not None:
             result = self._check_price_ratio(ad, median_price)
             if result.is_filtered:

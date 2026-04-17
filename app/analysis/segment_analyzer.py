@@ -798,11 +798,14 @@ class SegmentAnalyzer:
                 )
 
                 # Собираем dict для анализа
-                # Извлекаем категорию из segment_key (первая часть до '|')
-                _category = segment_key_str.split('|')[0] if segment_key_str else 'unknown'
-
+                # Извлекаем компоненты сегмента из segment_key
                 stats_dict: dict[str, Any] = {
-                    'category': _category,
+                    'category': segment_key.category or 'unknown',
+                    'brand': segment_key.brand or 'unknown',
+                    'model': segment_key.model or 'unknown',
+                    'condition': segment_key.condition or 'unknown',
+                    'location': segment_key.location or 'unknown',
+                    'seller_type': 'unknown',
                     'sample_size': stats_obj.sample_size or 0,
                     'listing_count': stats_obj.listing_count or 0,
                     'median_price': stats_obj.listing_price_median,

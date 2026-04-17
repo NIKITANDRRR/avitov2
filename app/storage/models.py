@@ -515,6 +515,11 @@ class SegmentStats(Base):
     segment_key: Mapped[str] = mapped_column(String, nullable=False)
     segment_name: Mapped[str | None] = mapped_column(String, nullable=True)
     category: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
+    brand: Mapped[str] = mapped_column(String(256), nullable=False, default="unknown")
+    model: Mapped[str] = mapped_column(String(256), nullable=False, default="unknown")
+    condition: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
+    location: Mapped[str] = mapped_column(String(256), nullable=False, default="unknown")
+    seller_type: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
 
     # Ценовые метрики
     median_7d: Mapped[float | None] = mapped_column(Float, nullable=True)

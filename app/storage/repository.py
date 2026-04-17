@@ -1027,10 +1027,27 @@ class Repository:
                     savepoint.commit()
                     return existing
 
+                # Гарантируем, что NOT NULL колонки имеют значения
+                _not_null_defaults = {
+                    "category": "unknown",
+                    "brand": "unknown",
+                    "model": "unknown",
+                    "condition": "unknown",
+                    "location": "unknown",
+                    "seller_type": "unknown",
+                }
+                filtered_stats = {
+                    k: v for k, v in stats.items() if hasattr(SegmentStats, k)
+                }
+                for col, default in _not_null_defaults.items():
+                    filtered_stats.setdefault(col, default)
+                    if filtered_stats[col] is None:
+                        filtered_stats[col] = default
+
                 new_stats = SegmentStats(
                     search_id=search_id,
                     segment_key=segment_key,
-                    **{k: v for k, v in stats.items() if hasattr(SegmentStats, k)},
+                    **filtered_stats,
                 )
                 self.session.add(new_stats)
                 self.session.flush()

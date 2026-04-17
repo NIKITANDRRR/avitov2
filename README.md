@@ -11,7 +11,8 @@
 5. **Трекинг оборачиваемости** — отслеживается сколько дней объявление на рынке, быстро ли исчезло
 6. **Детекция недооценённых** — составной критерий: IQR + Z-score + % от медианы
 7. **Детекция «бриллиантов»** — редкие товары с ценой << ликвидной оценки
-8. **Уведомления** — Telegram и/или Email о найденных недооценённых товарах
+8. **Парсинг профилей продавцов** — автоматический сбор данных о проданных товарах со страниц пользователей
+9. **Уведомления** — Telegram и/или Email о найденных недооценённых товарах
 
 ## Планировщик
 
@@ -26,6 +27,7 @@
 - **Изоляция контекста**: каждый поиск работает в отдельном BrowserContext
 - **Раздельные rate limiter'ы**: 6 запросов/мин для поиска, 8 для карточек
 - **Retry с exponential backoff**: до 3 попыток при ошибках навигации
+- **Warm-up режим**: при первом запуске — сниженная параллельность и увеличенные задержки
 
 ## Быстрый старт
 
@@ -56,6 +58,7 @@ CREATE DATABASE avito_monitor OWNER avito;
 ```bash
 python scripts/init_db.py
 python scripts/migrate_segment_analysis.py --up
+python -m scripts.migrate_seller_sold_items
 ```
 
 ### 4. Запуск на постоянную работу
@@ -75,9 +78,10 @@ python -m app.main run-once
 | Команда | Описание |
 |---------|----------|
 | `python -m app.main start` | Полный запуск: инициализация + заполнение поисков + планировщик |
-| `python -m app.main run-once` | Один цикл сбора и анализа |
+| `python -m app.main run-once` | Один цикл сбора и анализа (по умолчанию — принудительно все поиски) |
 | `python -m app.main run` | Legacy-режим по SEARCH_URLS из .env |
 | `python -m app.main run-scheduler` | Планировщик по поисковым запросам из БД |
+| `python -m app.main force-parse` | Принудительный парсинг: товары сразу, затем категории по очереди |
 
 ### Управление поисками
 
@@ -127,6 +131,17 @@ undervalue_score = 0.4 × iqr_score + 0.3 × zscore_score + 0.3 × median_score
 2. Родительский сегмент (brand вместо brand:model)
 3. Текущая медиана с пониженной уверенностью
 
+## Парсинг профилей продавцов
+
+Система автоматически собирает данные о проданных товарах со страниц продавцов Avito:
+
+- **Модель `Seller`** — реестр продавцов с рейтингом, отзывами, статистикой продаж
+- **Модель `SoldItem`** — проданные товары с ценой, категорией, датой продажи
+- **Парсер `seller_parser.py`** — извлечение данных из HTML профиля продавца
+- **Интеграция в пайплайн** — автоматический сбор после обработки объявлений
+
+Настройки: `SELLER_PROFILE_ENABLED`, `SELLER_RATE_LIMIT_PER_MINUTE`, `SELLER_MAX_PROFILES_PER_CYCLE`, `SELLER_SCRAPE_INTERVAL_HOURS`.
+
 ## Структура проекта
 
 ```
@@ -134,11 +149,15 @@ app/
 ├── config/          # Конфигурация (pydantic-settings)
 ├── collector/       # Сбор данных через Playwright + Chromium
 ├── parser/          # HTML-парсеры (BeautifulSoup + lxml)
+│   ├── ad_parser.py       # Парсинг карточки объявления
+│   ├── search_parser.py   # Парсинг поисковой выдачи
+│   └── seller_parser.py   # Парсинг профиля продавца
 ├── storage/         # PostgreSQL через SQLAlchemy (модели, репозиторий)
 ├── analysis/        # Ценовой анализатор v2 + сегментный анализ
 ├── notifier/        # Telegram и Email уведомления
 ├── scheduler/       # Пайплайн, планировщик и CLI (Typer)
 └── utils/           # Утилиты и исключения
+config/              # Конфигурационные файлы (products.json, categories.json)
 scripts/             # Скрипты инициализации и миграций
 data/raw_html/       # Сохранённый HTML (search/ и ad/)
 ```
@@ -149,10 +168,12 @@ data/raw_html/       # Сохранённый HTML (search/ и ad/)
 |--------|-----------|
 | [`scripts/init_db.py`](scripts/init_db.py) | Инициализация таблиц в БД |
 | [`scripts/migrate_segment_analysis.py`](scripts/migrate_segment_analysis.py) | Миграция сегментного анализа |
+| [`scripts/migrate_seller_sold_items.py`](scripts/migrate_seller_sold_items.py) | Миграция таблиц продавцов и проданных товаров |
 | [`scripts/seed_searches.py`](scripts/seed_searches.py) | Заполнение поисковых запросов |
 | [`scripts/seed_category_searches.py`](scripts/seed_category_searches.py) | Заполнение категорийных поисков |
 | [`scripts/migrate_category_monitoring.py`](scripts/migrate_category_monitoring.py) | Миграция категорийного мониторинга |
 | [`scripts/cleanup_duplicates.py`](scripts/cleanup_duplicates.py) | Очистка дубликатов |
+| [`scripts/db_stats.py`](scripts/db_stats.py) | Статистика базы данных |
 
 ## Переменные окружения
 
@@ -180,6 +201,10 @@ data/raw_html/       # Сохранённый HTML (search/ и ad/)
 | `TEMPORAL_WINDOW_DAYS` | `14` | Окно анализа цен (дни) |
 | `UNDERVALUED_THRESHOLD` | `0.3` | Порог composite score |
 | `LOG_LEVEL` | `INFO` | Уровень логирования |
+| `SELLER_PROFILE_ENABLED` | `true` | Включить парсинг профилей продавцов |
+| `SELLER_RATE_LIMIT_PER_MINUTE` | `3` | Rate limit для запросов к профилям |
+| `SELLER_MAX_PROFILES_PER_CYCLE` | `5` | Макс. профилей за цикл |
+| `SELLER_SCRAPE_INTERVAL_HOURS` | `24` | Интервал повторного парсинга профиля (часы) |
 
 ## Требования
 

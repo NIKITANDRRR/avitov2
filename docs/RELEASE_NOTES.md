@@ -1,24 +1,69 @@
 # Release Notes — Avito Price Monitor
 
-## [Unreleased] - 2026-04-17
+## [2026-04-17] — Парсинг проданных товаров продавцов
 
-### Оптимизация производительности парсера
+### Новое
+- **Парсинг профилей продавцов** — автоматический сбор данных о проданных товарах со страниц пользователей Avito
+  - Новая модель `Seller` — реестр продавцов с рейтингом, отзывами, статистикой продаж
+  - Новая модель `SoldItem` — проданные товары с ценой, категорией, датой продажи
+  - Парсер `seller_parser.py` — извлечение данных из HTML профиля продавца
+  - Метод `collect_seller_page()` в коллекторе — загрузка страниц профилей
+  - Интеграция в пайплайн — автоматический сбор после обработки объявлений
+- **Команда `force-parse`** — принудительный парсинг: сначала все товарные поиски, затем категории по очереди с интервалом
+- **Warm-up режим** — при первом запуске сниженная параллельность и увеличенные задержки для предотвращения бана
+- **Скрипт `db_stats.py`** — расширенная статистика базы данных
+- **structlog** — структурированное логирование вместо стандартного logging
 
-#### Added
+### Настройки
+- `SELLER_PROFILE_ENABLED` — включение/выключение парсинга профилей (по умолчанию: True)
+- `SELLER_RATE_LIMIT_PER_MINUTE` — rate limit для запросов к профилям (по умолчанию: 3/мин)
+- `SELLER_MAX_PROFILES_PER_CYCLE` — макс. количество профилей за цикл (по умолчанию: 5)
+- `SELLER_SCRAPE_INTERVAL_HOURS` — интервал повторного парсинга (по умолчанию: 24ч)
+- `SELLER_PAGE_DELAY_MIN` / `SELLER_PAGE_DELAY_MAX` — задержки между страницами профиля (5–12 сек)
+- `WARMUP_ENABLED` — режим разогрева при первом запуске (по умолчанию: True)
+- `WARMUP_INITIAL_DELAY` — начальная задержка перед первым запросом (60 сек)
+- `WARMUP_SEARCH_DELAY` — задержка между поисками при warm-up (30 сек)
+- `WARMUP_AD_DELAY_MIN` / `WARMUP_AD_DELAY_MAX` — задержки между карточками при warm-up (10–20 сек)
+- `WARMUP_MAX_CONCURRENT_SEARCHES` — параллельность поисков при warm-up (1)
+- `WARMUP_MAX_CONCURRENT_ADS` — параллельность карточек при warm-up (1)
+- `FORCE_PARSE_PRODUCT_DELAY_SECONDS` — задержка после парсинга товаров перед категориями (60 сек)
+- `FORCE_PARSE_CATEGORY_INTERVAL_SECONDS` — интервал между категориями при force-parse (60 сек)
+
+### Миграция
+- Запустить `python -m scripts.migrate_seller_sold_items` для создания таблиц `sellers`, `sold_items` и добавления FK в `ads`
+
+### Изменённые файлы
+- `app/storage/models.py` — модели `Seller`, `SoldItem`, поле `seller_id_fk` в `Ad`
+- `app/config/settings.py` — блоки настроек `SELLER_*`, `WARMUP_*`, `FORCE_PARSE_*`
+- `app/parser/ad_parser.py` — извлечение `seller_id`, `seller_url` из карточки
+- `app/parser/seller_parser.py` — новый парсер профиля продавца
+- `app/parser/__init__.py` — экспорт `SellerProfileData`, `SoldItemData`, `parse_seller_profile`
+- `app/collector/collector.py` — метод `collect_seller_page()`, селекторы для профиля продавца
+- `app/storage/repository.py` — CRUD для Seller/SoldItem (9 новых методов)
+- `app/scheduler/pipeline.py` — метод `_collect_seller_profiles()`, привязка продавца в `_process_ad()`
+- `app/scheduler/cli.py` — команда `force-parse`, warm-up логика
+- `scripts/migrate_seller_sold_items.py` — миграция БД
+- `scripts/db_stats.py` — расширенная статистика БД
+
+---
+
+## [2026-04-17] — Оптимизация производительности парсера
+
+### Added
 - **Изоляция контекста браузера**: каждый поиск работает в отдельном `BrowserContext` (настройка `USE_ISOLATED_CONTEXTS`)
 - **Раздельные rate limiter'ы**: независимые лимиты для поиска (6/мин) и карточек (8/мин) (`SEARCH_RATE_LIMIT_PER_MINUTE`, `AD_RATE_LIMIT_PER_MINUTE`)
 - **Retry с exponential backoff**: до 3 попыток при ошибках навигации с задержкой 5→10→20 сек (`RETRY_MAX_ATTEMPTS`, `RETRY_BACKOFF_BASE`, `RETRY_BACKOFF_MAX`)
 - **Batch-операции с БД**: `batch_get_or_create_ads()` для массового создания/обновления объявлений
 - **Асинхронная запись HTML**: `asyncio.to_thread()` для неблокирующего сохранения HTML-файлов
 
-#### Changed
+### Changed
 - **Задержки уменьшены**: 3–8 сек вместо 5–15 сек (`MIN_DELAY_SECONDS`: 5→3, `MAX_DELAY_SECONDS`: 15→8)
 - **`DEFAULT_SCHEDULE_INTERVAL_HOURS`**: тип изменён с `int` на `float`, default 2→0.5 (30 мин)
 - **`schedule_interval_hours` в БД**: тип колонки изменён с `INTEGER` на `FLOAT` (миграция в `init_db.py`)
 - **`make_interval` в SQL**: использует секунды (`hours * 3600`) для поддержки дробных часов
 - **CLI `add-search`**: параметр `--interval` теперь `float` (default 0.5)
 
-#### New Settings
+### New Settings
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | `SEARCH_RATE_LIMIT_PER_MINUTE` | `6` | Максимум запросов поиска в минуту |
@@ -77,10 +122,10 @@
 
 ---
 
-## Что нового
+## Категорийный мониторинг
 
 ### 1. Категорийный мониторинг (category search)
-Система теперь умеет искать товары не по конкретным моделям, а по **целым категориям** (например, «все iPhone» или «все MacBook»). Из заголовков объявлений автоматически извлекаются:
+Система умеет искать товары не по конкретным моделям, а по **целым категориям** (например, «все iPhone» или «все MacBook»). Из заголовков объявлений автоматически извлекаются:
 - **Категория** (телефон, ноутбук, планшет)
 - **Бренд** (Apple, Samsung, Xiaomi)
 - **Модель** (iPhone 15 Pro Max, MacBook Air M3)
@@ -114,45 +159,19 @@
 ### 6. Уведомления
 - **Telegram** через Telethon + MTProto-прокси
 - **Email** через SMTP (Gmail) — fallback если Telegram недоступен
-- Получатели: nikitandrrr@gmail.com, messmax74@gmail.com
 
 ---
 
-## Как запустить
-
-```bash
-# Один проход (тест)
-.venv\Scripts\python.exe -m app.scheduler.cli test
-
-# На ночь (циклический, каждые 5 мин)
-.venv\Scripts\python.exe -m app.scheduler.cli run-scheduler
-
-# Добавить поиск
-.venv\Scripts\python.exe -m app.scheduler.cli add-search "iPhone 16 Pro" --location Россия
-
-# Список поисков
-.venv\Scripts\python.exe -m app.scheduler.cli list-searches
-```
-
----
-
-## Новые таблицы в БД
+## Таблицы в БД
 
 | Таблица | Назначение |
 |---|---|
-| `segment_stats` | Предрасчитанная статистика по сегментам (медиана, IQR, тренды) |
+| `tracked_searches` | Поисковые запросы |
+| `search_runs` | Записи о запусках сбора |
+| `ads` | Объявления Avito |
+| `ad_snapshots` | Снимки цен объявлений |
+| `notifications_sent` | Отправленные уведомления |
+| `sellers` | Профили продавцов |
+| `sold_items` | Проданные товары продавцов |
+| `segment_stats` | Предрасчитанная статистика по сегментам |
 | `segment_price_history` | Ежедневные снимки цен по сегментам |
-
----
-
-## Новые параметры в .env
-
-| Параметр | По умолчанию | Описание |
-|---|---|---|
-| `ATTRIBUTE_EXTRACTION_ENABLED` | `true` | Извлечение атрибутов из заголовков |
-| `CATEGORY_MIN_SEGMENT_SIZE` | `5` | Мин. размер сегмента для анализа |
-| `CATEGORY_DISCOUNT_THRESHOLD` | `0.7` | Порог: цена < медиана × 0.7 → бриллиант |
-| `CATEGORY_MAX_ADS_PER_RUN` | `20` | Макс. объявлений для category-поиска |
-| `CATEGORY_SEGMENT_CACHE_TTL_HOURS` | `4` | Время жизни кэша статистики |
-| `ENABLE_ACCESSORY_FILTER` | `true` | Фильтрация аксессуаров |
-| `MIN_PRICE_FILTER` | `5000` | Минимальная цена для анализа |

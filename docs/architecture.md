@@ -1,13 +1,13 @@
 # Архитектура Avito Price Monitor
 
-> **Версия:** 3.1
+> **Версия:** 4.0
 > **Дата:** 2026-04-17
 
 ---
 
 ## 1. Обзор системы
 
-**Назначение:** автоматический мониторинг цен на Avito, обнаружение недооценённых товаров и отправка уведомлений через Telegram/Email.
+**Назначение:** автоматический мониторинг цен на Avito, обнаружение недооценённых товаров, парсинг профилей продавцов и отправка уведомлений через Telegram/Email.
 
 **Стек технологий:**
 
@@ -18,6 +18,7 @@
 | Парсинг | BeautifulSoup4 + lxml |
 | База данных | PostgreSQL (через SQLAlchemy 2.x) |
 | CLI | Typer |
+| Логирование | structlog |
 | Уведомления | Telethon (Telegram), aiosmtplib (Email) |
 | Настройки | pydantic-settings + .env |
 
@@ -35,14 +36,15 @@
 | Команда | Функция | Описание |
 |---|---|---|
 | `start` | [`start()`](app/scheduler/cli.py:153) | Полный запуск: init-db + seed + scheduler |
-| `run-scheduler` | [`run_scheduler()`](app/scheduler/cli.py:175) | Циклический планировщик |
-| `run-once` | [`run_once()`](app/scheduler/cli.py:181) | Один цикл по просроченным поискам |
-| `run` | [`run()`](app/scheduler/cli.py:169) | Legacy: один цикл по SEARCH_URLS из .env |
+| `run-scheduler` | [`run_scheduler()`](app/scheduler/cli.py:179) | Циклический планировщик |
+| `run-once` | [`run_once()`](app/scheduler/cli.py:185) | Один цикл (по умолч. принудительно — все поиски) |
+| `run` | [`run()`](app/scheduler/cli.py:173) | Legacy: один цикл по SEARCH_URLS из .env |
+| `force-parse` | [`force_parse()`](app/scheduler/cli.py:196) | Принудительный парсинг: товары, затем категории |
 | `add-search` | [`add_search()`](app/scheduler/cli.py:21) | Добавить поисковый запрос |
 | `list-searches` | [`list_searches()`](app/scheduler/cli.py:103) | Список всех поисков |
 | `remove-search` | [`remove_search()`](app/scheduler/cli.py:69) | Удалить поиск |
-| `init-db` | [`init_db()`](app/scheduler/cli.py:191) | Создать таблицы в PostgreSQL |
-| `test-telegram` | [`test_telegram()`](app/scheduler/cli.py:204) | Проверить подключение к Telegram |
+| `init-db` | [`init_db()`](app/scheduler/cli.py:206) | Создать таблицы в PostgreSQL |
+| `test-telegram` | [`test_telegram()`](app/scheduler/cli.py:219) | Проверить подключение к Telegram |
 
 ### 2.2 Планировщик (Scheduler)
 
@@ -63,6 +65,7 @@
 | Задержки между действиями | 3–8 сек | `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` |
 | Rate limiter поиска | 6 запросов/мин | `SEARCH_RATE_LIMIT_PER_MINUTE` |
 | Rate limiter карточек | 8 запросов/мин | `AD_RATE_LIMIT_PER_MINUTE` |
+| Rate limiter продавцов | 3 запроса/мин | `SELLER_RATE_LIMIT_PER_MINUTE` |
 | Retry при ошибках | до 3 попыток | `RETRY_MAX_ATTEMPTS` |
 | Изоляция контекста | отдельный контекст на поиск | `USE_ISOLATED_CONTEXTS` |
 
@@ -74,15 +77,18 @@
 **Методы:**
 - [`collect_search_page()`](app/collector/collector.py:46) — загружает поисковую выдачу, имитирует скролл, сохраняет HTML в `data/raw_html/search/`
 - [`collect_ad_page()`](app/collector/collector.py:133) — загружает карточку объявления, сохраняет HTML в `data/raw_html/ad/`
+- [`collect_seller_page()`](app/collector/collector.py) — загружает страницу профиля продавца
 
 ### 2.4 Парсер (Parser)
 
 - [`app/parser/search_parser.py`](app/parser/search_parser.py) — [`parse_search_page()`](app/parser/search_parser.py:38): парсинг списка объявлений, три стратегии селекторов с fallback
 - [`app/parser/ad_parser.py`](app/parser/ad_parser.py) — [`parse_ad_page()`](app/parser/ad_parser.py:47): парсинг детальной страницы объявления
+- [`app/parser/seller_parser.py`](app/parser/seller_parser.py) — [`parse_seller_profile()`](app/parser/seller_parser.py): парсинг профиля продавца
 
 **Извлекаемые данные:**
 - Поиск: `ad_id`, `url`, `title`, `price_str`, `location`
-- Карточка: `title`, `price`, `location`, `seller_name`, `condition`, `publication_date`, `description`
+- Карточка: `title`, `price`, `location`, `seller_name`, `seller_id`, `seller_url`, `condition`, `publication_date`, `description`
+- Профиль продавца: `seller_id`, `seller_name`, `rating`, `reviews_count`, `total_sold_items`, список проданных товаров
 
 ### 2.5 Анализатор (Analysis)
 
@@ -93,7 +99,7 @@
 
 ### 2.6 Хранилище (Storage)
 
-- [`app/storage/models.py`](app/storage/models.py) — SQLAlchemy-модели (TrackedSearch, SearchRun, Ad, AdSnapshot, NotificationSent, SegmentStats, SegmentPriceHistory)
+- [`app/storage/models.py`](app/storage/models.py) — SQLAlchemy-модели (TrackedSearch, SearchRun, Ad, AdSnapshot, NotificationSent, Seller, SoldItem, SegmentStats, SegmentPriceHistory)
 - [`app/storage/repository.py`](app/storage/repository.py) — CRUD-операции с БД
 - [`app/storage/database.py`](app/storage/database.py) — подключение к PostgreSQL, `engine`, `Session`, `Base`
 
@@ -108,7 +114,7 @@
 
 ### 3.1 TrackedSearch
 
-Поисковый запрос: [`TrackedSearch`](app/storage/models.py:33)
+Поисковый запрос: [`TrackedSearch`](app/storage/models.py:34)
 
 | Поле | Тип | Описание |
 |---|---|---|
@@ -126,7 +132,7 @@
 
 ### 3.2 Ad
 
-Объявление: [`Ad`](app/storage/models.py:152)
+Объявление: [`Ad`](app/storage/models.py:153)
 
 | Поле | Тип | Описание |
 |---|---|---|
@@ -136,6 +142,7 @@
 | `price` | Float | Цена |
 | `location` | String(256) | Местоположение |
 | `seller_name` / `seller_type` | String | Продавец |
+| `seller_id_fk` | Integer (FK) | Связь с Seller |
 | `condition` | String(128) | Состояние |
 | `first_seen_at` | DateTime | Первое обнаружение |
 | `last_seen_at` | DateTime | Последнее обнаружение |
@@ -149,16 +156,54 @@
 | `ad_category` | String(256) | Категория |
 | `brand` / `extracted_model` | String(256) | Бренд и модель |
 
-**Связи:** `snapshots` (→ AdSnapshot), `notifications` (→ NotificationSent)
+**Связи:** `seller` (→ Seller), `snapshots` (→ AdSnapshot), `notifications` (→ NotificationSent)
 
-### 3.3 SegmentStats
+### 3.3 Seller
 
-Статистика сегмента: [`SegmentStats`](app/storage/models.py:341)
+Профиль продавца: [`Seller`](app/storage/models.py:262)
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `seller_id` | String(100) | ID продавца на Avito (unique) |
+| `seller_url` | String(500) | URL профиля продавца |
+| `seller_name` | String(255) | Имя продавца |
+| `rating` | Float | Рейтинг продавца |
+| `reviews_count` | Integer | Количество отзывов |
+| `total_sold_items` | Integer | Общее кол-во проданных товаров |
+| `first_seen_at` | DateTime | Когда впервые обнаружен |
+| `last_scraped_at` | DateTime | Когда последний раз парсили профиль |
+| `scrape_status` | String(50) | Статус парсинга (pending/scraped/failed) |
+
+**Связи:** `ads` (→ Ad), `sold_items` (→ SoldItem)
+
+### 3.4 SoldItem
+
+Проданный товар: [`SoldItem`](app/storage/models.py:335)
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `seller_id_fk` | Integer (FK) | Связь с Seller |
+| `item_id` | String(100) | ID товара на Avito |
+| `title` | String(500) | Название проданного товара |
+| `price` | Float | Цена продажи |
+| `price_str` | String(100) | Сырая строка цены |
+| `category` | String(255) | Категория товара |
+| `sold_date` | DateTime | Дата продажи |
+| `item_url` | String(500) | URL товара |
+| `scraped_at` | DateTime | Когда спарсено |
+
+**Связи:** `seller` (→ Seller)
+
+### 3.5 SegmentStats
+
+Статистика сегмента: [`SegmentStats`](app/storage/models.py:479)
 
 | Поле | Тип | Описание |
 |---|---|---|
 | `search_id` | Integer (FK) | Связь с TrackedSearch |
 | `segment_key` | String | Ключ сегмента (brand:model) |
+| `segment_name` | String | Человекочитаемое название |
+| `category` | String(128) | Категория сегмента |
 | `median_7d` / `median_30d` / `median_90d` | Float | Медианы за периоды |
 | `price_trend_slope` | Float | Наклон тренда цены |
 | `sample_size` / `listing_count` | Integer | Размер выборки / активных |
@@ -171,9 +216,9 @@
 
 **Связи:** `search` (→ TrackedSearch), `price_history` (→ SegmentPriceHistory)
 
-### 3.4 SegmentPriceHistory
+### 3.6 SegmentPriceHistory
 
-История цен сегмента по дням: [`SegmentPriceHistory`](app/storage/models.py:438)
+История цен сегмента по дням: [`SegmentPriceHistory`](app/storage/models.py:577)
 
 | Поле | Тип | Описание |
 |---|---|---|
@@ -185,14 +230,14 @@
 
 Уникальный индекс: один снапшот в день на сегмент.
 
-### 3.5 AdSnapshot и NotificationSent
+### 3.7 AdSnapshot и NotificationSent
 
-- [`AdSnapshot`](app/storage/models.py:254) — снимок цены: `ad_id`, `price`, `scraped_at`, `html_path`
-- [`NotificationSent`](app/storage/models.py:294) — отправленное уведомление: `ad_id`, `notification_type`, `sent_at`, `telegram_message_id`
+- [`AdSnapshot`](app/storage/models.py:392) — снимок цены: `ad_id`, `price`, `scraped_at`, `html_path`
+- [`NotificationSent`](app/storage/models.py:432) — отправленное уведомление: `ad_id`, `notification_type`, `sent_at`, `telegram_message_id`
 
-### 3.6 SearchRun
+### 3.8 SearchRun
 
-- [`SearchRun`](app/storage/models.py:98) — запись о запуске: `tracked_search_id`, `started_at`, `completed_at`, `status`, `ads_found`, `ads_new`, `errors_count`
+- [`SearchRun`](app/storage/models.py:99) — запись о запуске: `tracked_search_id`, `started_at`, `completed_at`, `status`, `ads_found`, `ads_new`, `pages_fetched`, `ads_opened`, `errors_count`, `error_message`
 
 ---
 
@@ -204,17 +249,20 @@ Avito.ru
   ▼
 Collector (Playwright/Chromium)
   ├── collect_search_page() → HTML поисковой страницы
-  └── collect_ad_page()     → HTML карточки объявления
+  ├── collect_ad_page()     → HTML карточки объявления
+  └── collect_seller_page() → HTML профиля продавца
   │                           Сохраняется в data/raw_html/
   ▼
 Parser (BeautifulSoup + lxml)
-  ├── parse_search_page() → [SearchResultItem]
-  └── parse_ad_page()     → AdData (title, price, location, seller, ...)
+  ├── parse_search_page()  → [SearchResultItem]
+  ├── parse_ad_page()      → AdData (title, price, location, seller, ...)
+  └── parse_seller_profile() → SellerProfileData + [SoldItemData]
   │
   ▼
 PostgreSQL (SQLAlchemy)
   ├── tracked_searches, search_runs
   ├── ads, ad_snapshots, notifications_sent
+  ├── sellers, sold_items
   ├── segment_stats, segment_price_history
   │
   ▼
@@ -283,6 +331,16 @@ score = 0.4 × IQR_компонент + 0.3 × Z-score_компонент + 0.3 
 - `is_disappeared_quickly` = True, если `days_on_market ≤ segment_fast_sale_days` (3 дня)
 - Быстрое исчезновение дешёвых объявлений = сигнал, что цена ниже рыночной
 
+### 5.5 Парсинг профилей продавцов
+
+После обработки объявлений пайплайн автоматически собирает профили продавцов:
+
+- Извлечение `seller_id` и `seller_url` из карточки объявления
+- Загрузка страницы профиля через [`collect_seller_page()`](app/collector/collector.py)
+- Парсинг данных продавца и списка проданных товаров через [`parse_seller_profile()`](app/parser/seller_parser.py)
+- Привязка продавца к объявлению через `seller_id_fk`
+- Ограничения: до 5 профилей за цикл, интервал повторного парсинга 24ч
+
 ---
 
 ## 6. Конфигурация
@@ -299,6 +357,7 @@ score = 0.4 × IQR_компонент + 0.3 × Z-score_компонент + 0.3 
 | **Браузер** | `HEADLESS` | `false` | Headless-режим |
 | **Rate limit** | `SEARCH_RATE_LIMIT_PER_MINUTE` | `6` | Максимум запросов поиска в минуту |
 | **Rate limit** | `AD_RATE_LIMIT_PER_MINUTE` | `8` | Максимум запросов карточек в минуту |
+| **Rate limit** | `SELLER_RATE_LIMIT_PER_MINUTE` | `3` | Максимум запросов к профилям в минуту |
 | **Retry** | `RETRY_MAX_ATTEMPTS` | `3` | Максимум попыток при ошибке загрузки |
 | **Retry** | `RETRY_BACKOFF_BASE` | `5.0` | Базовая задержка exponential backoff (сек) |
 | **Контекст** | `USE_ISOLATED_CONTEXTS` | `true` | Отдельный контекст браузера на каждый поиск |
@@ -309,6 +368,10 @@ score = 0.4 × IQR_компонент + 0.3 × Z-score_компонент + 0.3 
 | **Анализ** | `ZSCORE_THRESHOLD` | `1.5` | Порог z-score |
 | **Сегменты** | `segment_rare_threshold` | `5` | Мин. объявлений для не-редкого сегмента |
 | **Сегменты** | `segment_fast_sale_days` | `3` | Дней для быстрой продажи |
+| **Продавцы** | `SELLER_PROFILE_ENABLED` | `true` | Включить парсинг профилей продавцов |
+| **Продавцы** | `SELLER_MAX_PROFILES_PER_CYCLE` | `5` | Макс. профилей за цикл |
+| **Продавцы** | `SELLER_SCRAPE_INTERVAL_HOURS` | `24` | Интервал повторного парсинга (часы) |
+| **Warm-up** | `WARMUP_ENABLED` | `true` | Режим разогрева при первом запуске |
 | **Telegram** | `TELEGRAM_BOT_TOKEN` | `""` | Токен бота |
 | **Email** | `SMTP_HOST` | `smtp.gmail.com` | SMTP-сервер |
 
@@ -330,6 +393,7 @@ playwright install chromium
 ```bash
 python -m app.main init-db        # Создание таблиц
 python scripts/seed_searches.py   # Заполнение поисковыми запросами
+python -m scripts.migrate_seller_sold_items  # Миграция продавцов
 ```
 
 ### Запуск
@@ -341,8 +405,14 @@ python -m app.main start
 # Только планировщик (если БД уже инициализирована)
 python -m app.main run-scheduler
 
-# Однократный запуск
+# Однократный запуск (принудительно все поиски)
 python -m app.main run-once
+
+# Однократный запуск (только просроченные)
+python -m app.main run-once --no-force
+
+# Принудительный парсинг
+python -m app.main force-parse
 ```
 
 ### Управление поисками
@@ -355,7 +425,9 @@ python -m app.main remove-search 5
 
 ### Мониторинг
 
-Логирование через стандартный `logging` (уровень настраивается через `LOG_LEVEL` в .env). HTML-файлы сохраняются в `data/raw_html/`.
+Логирование через `structlog` (уровень настраивается через `LOG_LEVEL` в .env). HTML-файлы сохраняются в `data/raw_html/`.
+
+Статистика БД: `python scripts/db_stats.py`
 
 ### Зависимости
 
@@ -370,5 +442,7 @@ python -m app.main remove-search 5
 | `pydantic` / `pydantic-settings` | 2.11.3 / 2.8.1 | Валидация настроек |
 | `telethon` | ≥1.34.0 | Telegram-клиент (MTProto) |
 | `typer` | 0.15.2 | CLI-интерфейс |
+| `structlog` | 24.4.0 | Структурированное логирование |
 | `numpy` | 2.2.4 | Математические вычисления |
 | `aiosmtplib` | ≥3.0.0 | Асинхронная отправка email |
+| `psutil` | ≥5.9.0 | Мониторинг системных ресурсов |

@@ -33,72 +33,35 @@ CONDITION_KEYWORDS: dict[str, list[str]] = {
 # ---------------------------------------------------------------------------
 
 DEFAULT_BRAND_DICTIONARIES: dict[str, dict[str, dict]] = {
-    "телефоны": {
-        "apple": {
-            "patterns": ["iphone", "айфон"],
+    "телевизоры": {
+        "samsung": {
+            "patterns": ["samsung", "самсунг"],
             "models": [
-                "iphone 16 pro max", "iphone 16 pro", "iphone 16 plus", "iphone 16",
-                "iphone 15 pro max", "iphone 15 pro", "iphone 15 plus", "iphone 15",
-                "iphone 14 pro max", "iphone 14 pro", "iphone 14 plus", "iphone 14",
-                "iphone 13 pro max", "iphone 13 pro", "iphone 13 mini", "iphone 13",
-                "iphone 12 pro max", "iphone 12 pro", "iphone 12 mini", "iphone 12",
-                "iphone 11 pro max", "iphone 11 pro", "iphone 11",
-                "iphone se", "iphone xs", "iphone xr", "iphone x",
+                "qe55qn90b", "qe65qn90b", "ue55au7100", "ue43tu7097",
             ],
         },
-        "samsung": {
-            "patterns": ["samsung", "самсунг", "galaxy"],
+        "lg": {
+            "patterns": ["lg", "элджи"],
             "models": [
-                "galaxy s24 ultra", "galaxy s24+", "galaxy s24",
-                "galaxy s23 ultra", "galaxy s23+", "galaxy s23",
-                "galaxy s22 ultra", "galaxy s22+", "galaxy s22",
-                "galaxy a55", "galaxy a54", "galaxy a53",
-                "galaxy a35", "galaxy a34", "galaxy a33",
-                "galaxy z flip", "galaxy z fold",
+                "oled55c16la", "oled55b16la", "55nano776pa", "43up75006lf",
+            ],
+        },
+        "sony": {
+            "patterns": ["sony", "сони"],
+            "models": [
+                "kd55xr70", "kd65xr70", "kd55x80j", "kd65x90j",
             ],
         },
         "xiaomi": {
-            "patterns": ["xiaomi", "сяоми", "redmi", "poco"],
+            "patterns": ["xiaomi", "сяоми", "mi tv", "redmi tv"],
             "models": [
-                "redmi note 13 pro+", "redmi note 13 pro", "redmi note 13",
-                "redmi 13c", "redmi 13",
-                "poco x6 pro", "poco x6", "poco m6 pro",
-                "xiaomi 14", "xiaomi 13t", "xiaomi 13",
+                "mi tv p1 55", "mi tv q1e 55", "redmi tv 55",
             ],
         },
-        "google": {
-            "patterns": ["pixel", "google pixel"],
+        "hisense": {
+            "patterns": ["hisense", "хайсенс"],
             "models": [
-                "pixel 9 pro", "pixel 9",
-                "pixel 8 pro", "pixel 8",
-                "pixel 7 pro", "pixel 7",
-                "pixel 6 pro", "pixel 6",
-            ],
-        },
-    },
-    "ноутбуки": {
-        "apple": {
-            "patterns": ["macbook", "макбук"],
-            "models": [
-                "macbook pro 16 m3", "macbook pro 16 m2", "macbook pro 16 m1",
-                "macbook pro 14 m3", "macbook pro 14 m2", "macbook pro 14 m1",
-                "macbook air 15 m3", "macbook air 15 m2",
-                "macbook air 13 m3", "macbook air 13 m2", "macbook air 13 m1",
-            ],
-        },
-        "lenovo": {
-            "patterns": ["lenovo", "thinkpad", "legion", "ideapad"],
-            "models": [
-                "thinkpad x1 carbon", "thinkpad t14", "thinkpad t16",
-                "legion 5 pro", "legion 5", "legion 7",
-                "ideapad 5", "ideapad 3", "ideapad gaming",
-            ],
-        },
-        "asus": {
-            "patterns": ["asus", "rog", "zenbook", "vivobook"],
-            "models": [
-                "rog strix g16", "rog strix g18", "rog zephyrus g14", "rog zephyrus g16",
-                "zenbook 14", "zenbook 15", "vivobook 15", "vivobook 16",
+                "55u7kqf", "65u7kqf", "55e7kqf",
             ],
         },
     },
@@ -106,80 +69,89 @@ DEFAULT_BRAND_DICTIONARIES: dict[str, dict[str, dict]] = {
         "stels": {
             "patterns": ["stels", "стелс"],
             "models": [
-                "navigator 800", "navigator 760", "navigator 630",
-                "pilot 950", "pilot 710",
-                "aggressor", "challenge", "energy",
+                "navigator", "pilot", "jet", "challenge",
             ],
         },
         "merida": {
             "patterns": ["merida", "мерида"],
             "models": [
-                "big nine 15", "big nine 20", "big seven 15",
-                "matts 6.5", "matts 6.2",
-                "scultura 4000", "reacto 4000",
+                "big seven", "big nine", "duke", "matts",
             ],
         },
         "trek": {
             "patterns": ["trek"],
             "models": [
-                "marlin 7", "marlin 6", "marlin 5",
-                "x-caliber 8", "x-caliber 7",
-                "domane al 2", "emonda alr",
+                "marlin", "x-caliber", "fuel ex", "domane",
             ],
         },
         "forward": {
             "patterns": ["forward", "форвард"],
             "models": [
-                "impulse x", "impulse 29", "apex",
-                "sport 2.0", "sport 3.0", "trail",
+                "impulse", "apex", "sport", "next",
             ],
         },
         "altair": {
             "patterns": ["altair", "альтаир"],
             "models": [
-                "mtb ht 27.5", "mtb ht 29", "city 26",
+                "mtb", "city", "teen",
             ],
         },
     },
-    "шины": {
-        "michelin": {
-            "patterns": ["michelin", "мишлен"],
+    "саундбары": {
+        "samsung": {
+            "patterns": ["samsung", "самсунг"],
             "models": [
-                "x-ice north 4", "x-ice north 3", "x-ice 3",
-                "pilot sport 4", "pilot sport 5",
-                "primacy 4", "energy saver",
-                "crossclimate 2",
+                "hw q990b", "hw q930b", "hw q800b", "hw q700b", "hw s60b", "hw b650",
             ],
         },
-        "nokian": {
-            "patterns": ["nokian", "хакка", "hakka"],
+        "lg": {
+            "patterns": ["lg", "элджи"],
             "models": [
-                "hakkapeliitta r5", "hakkapeliitta r4",
-                "hakkapeliitta 9", "hakkapeliitta 8",
-                "nordman rs2", "nordman 7",
-                "wr d4", "wr a4",
+                "s95qr", "s80qy", "sp8ya", "sn11rg",
             ],
         },
-        "continental": {
-            "patterns": ["continental", "континенталь"],
+        "sony": {
+            "patterns": ["sony", "сони"],
             "models": [
-                "wintercontact ts870", "wintercontact ts860",
-                "premiumcontact 7", "premiumcontact 6",
-                "ecocontact 6",
+                "ht a7000", "ht a5000", "ht g700", "ht st5000",
             ],
         },
-        "pirelli": {
-            "patterns": ["pirelli", "пирелли"],
+        "jbl": {
+            "patterns": ["jbl"],
             "models": [
-                "winter sottozero 3", "ice zero",
-                "cinturato p7", "scorpion verde",
+                "bar 9.1", "bar 5.1", "bar 800", "bar 500",
             ],
         },
-        "kama": {
-            "patterns": ["kama", "кама"],
+        "yamaha": {
+            "patterns": ["yamaha", "ямаха"],
             "models": [
-                "euro-519", "euro-129", "breeze-131",
-                "hk-131", "flame-131",
+                "sr c30a", "yas 209", "music cast 220",
+            ],
+        },
+    },
+    "тв приставки": {
+        "nvidia": {
+            "patterns": ["nvidia", "нвидиа", "shield"],
+            "models": [
+                "shield tv 2019", "shield tv pro 2019", "shield tv 2017", "shield tv pro 2017",
+            ],
+        },
+        "apple": {
+            "patterns": ["apple", "apple tv", "эпл"],
+            "models": [
+                "apple tv 4k", "apple tv hd",
+            ],
+        },
+        "xiaomi": {
+            "patterns": ["xiaomi", "сяоми", "mi box", "mi tv stick"],
+            "models": [
+                "mi box s", "mi tv stick", "mi box 4k",
+            ],
+        },
+        "google": {
+            "patterns": ["google", "chromecast"],
+            "models": [
+                "chromecast with google tv", "chromecast 4k",
             ],
         },
     },

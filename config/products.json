@@ -1,0 +1,32 @@
+{
+  "model_searches": [
+    {
+      "search_phrase": "nvidia shield 2019",
+      "location": "россия",
+      "schedule_interval_hours": 2,
+      "max_ads_to_parse": 3,
+      "priority": 1
+    },
+    {
+      "search_phrase": "nvidia shield 2017",
+      "location": "россия",
+      "schedule_interval_hours": 2,
+      "max_ads_to_parse": 3,
+      "priority": 1
+    },
+    {
+      "search_phrase": "тыловые колонки swa-8500",
+      "location": "россия",
+      "schedule_interval_hours": 2,
+      "max_ads_to_parse": 3,
+      "priority": 1
+    },
+    {
+      "search_phrase": "тыловые колонки swa-9100",
+      "location": "россия",
+      "schedule_interval_hours": 2,
+      "max_ads_to_parse": 3,
+      "priority": 1
+    }
+  ]
+}

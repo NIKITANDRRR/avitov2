@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 
 import structlog
@@ -67,8 +68,11 @@ def extract_ad_id_from_url(url: str) -> str:
     raise ValueError(f"Cannot extract ad_id from URL: {url}")
 
 
-def save_html(html: str, directory: str, filename: str) -> str:
-    """Сохранение HTML-контента на диск.
+async def save_html(html: str, directory: str, filename: str) -> str:
+    """Асинхронное сохранение HTML-контента на диск.
+
+    Использует ``asyncio.to_thread`` для неблокирующей записи файла,
+    чтобы не приостанавливать event loop при I/O операциях.
 
     Args:
         html: HTML-контент для сохранения.
@@ -85,7 +89,7 @@ def save_html(html: str, directory: str, filename: str) -> str:
         filename = f"{filename}.html"
 
     file_path = dir_path / filename
-    file_path.write_text(html, encoding="utf-8")
+    await asyncio.to_thread(file_path.write_text, html, "utf-8")
 
     return str(file_path)
 
@@ -198,6 +202,7 @@ def build_avito_url(query: str, location: str = "Москва") -> str:
         "петербург": "sankt-peterburg",
         "екатеринбург": "ekaterinburg",
         "новосибирск": "novosibirsk",
+        "челябинск": "chelyabinsk",
         "россия": "rossiya",
     }
     location_slug = location_map.get(location.lower(), location.lower())
@@ -208,3 +213,51 @@ def build_avito_url(query: str, location: str = "Москва") -> str:
         f"https://www.avito.ru/{location_slug}"
         f"?q={encoded_query}&s=104"
     )
+
+
+class RateLimiter:
+    """Ограничение частоты запросов к Avito (скользящее окно).
+
+    Потокобезопасный (asyncio.Lock) ограничитель частоты запросов.
+    Использует алгоритм скользящего окна: хранит таймстемпы запросов
+    и блокирует новые запросы, если лимит за период исчерпан.
+
+    Attributes:
+        _max: Максимальное количество запросов за период.
+        _window: Длина окна в секундах.
+        _timestamps: Список таймстемпов последних запросов.
+        _lock: Асинхронный мьютекс для потокобезопасности.
+    """
+
+    def __init__(self, max_requests: int, per_seconds: int = 60) -> None:
+        self._max = max_requests
+        self._window = per_seconds
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Подождать, пока не будет безопасно сделать запрос.
+
+        Если лимит запросов за окно исчерпан — ожидает освобождения слота.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            # Удаляем старые таймстемпы за пределами окна
+            self._timestamps = [
+                t for t in self._timestamps if now - t < self._window
+            ]
+
+            if len(self._timestamps) >= self._max:
+                # Нужно подождать до освобождения слота
+                wait = self._window - (now - self._timestamps[0]) + 0.1
+                if wait > 0:
+                    logger = structlog.get_logger()
+                    logger.debug(
+                        "rate_limiter_waiting",
+                        wait_sec=round(wait, 2),
+                        max_requests=self._max,
+                        window_sec=self._window,
+                    )
+                    await asyncio.sleep(wait)
+
+            self._timestamps.append(time.monotonic())

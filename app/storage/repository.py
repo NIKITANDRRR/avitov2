@@ -321,6 +321,109 @@ class Repository:
                 f"Failed to get or create ad: {exc}"
             ) from exc
 
+    def batch_get_or_create_ads(
+        self,
+        items: list[dict],
+    ) -> list[tuple[Ad, bool]]:
+        """Массовое создание/получение объявлений.
+
+        Принимает список словарей с ключами ``ad_id``, ``url``, ``search_url``
+        и возвращает список кортежей ``(Ad, created)`` в том же порядке.
+
+        Использует ``IN``-запрос для получения существующих записей
+        и ``flush`` для массовой вставки новых.
+
+        Args:
+            items: Список словарей с полями объявления.
+
+        Returns:
+            list[tuple[Ad, bool]]: Список кортежей (объявление, флаг создания).
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        if not items:
+            return []
+
+        try:
+            # Собрать все ad_id
+            ad_ids = [item["ad_id"] for item in items]
+
+            # Получить существующие
+            stmt = select(Ad).where(Ad.ad_id.in_(ad_ids))
+            result = self.session.execute(stmt).scalars().all()
+            existing = {ad.ad_id: ad for ad in result}
+
+            # Создать недостающие
+            new_ads: list[Ad] = []
+            created_flags: dict[str, bool] = {}
+
+            for item in items:
+                aid = item["ad_id"]
+                if aid in existing:
+                    created_flags[aid] = False
+                else:
+                    ad = Ad(
+                        ad_id=aid,
+                        url=item["url"],
+                        search_url=item["search_url"],
+                    )
+                    self.session.add(ad)
+                    new_ads.append(ad)
+                    created_flags[aid] = True
+
+            if new_ads:
+                savepoint = self.session.begin_nested()
+                try:
+                    self.session.flush()
+                    savepoint.commit()
+                    # Обновить existing новыми объектами после flush
+                    for ad in new_ads:
+                        existing[ad.ad_id] = ad
+                except IntegrityError:
+                    savepoint.rollback()
+                    logger.warning(
+                        "batch_get_or_create_ads_rollback",
+                        count=len(new_ads),
+                    )
+                    # Перечитать из БД
+                    self.session.expire_all()
+                    stmt = select(Ad).where(Ad.ad_id.in_(ad_ids))
+                    result = self.session.execute(stmt).scalars().all()
+                    existing = {ad.ad_id: ad for ad in result}
+                    # Сбросить флаги created для тех, что уже есть
+                    for aid in ad_ids:
+                        if aid in existing:
+                            created_flags[aid] = False
+
+            logger.info(
+                "batch_get_or_create_ads",
+                total=len(items),
+                existing=len(items) - len(new_ads),
+                new=len(new_ads),
+            )
+
+            return [
+                (existing[item["ad_id"]], created_flags[item["ad_id"]])
+                for item in items
+            ]
+        except IntegrityError as exc:
+            logger.error(
+                "batch_get_or_create_ads_integrity_error",
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to batch get or create ads (integrity): {exc}"
+            ) from exc
+        except SQLAlchemyError as exc:
+            logger.error(
+                "batch_get_or_create_ads_failed",
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to batch get or create ads: {exc}"
+            ) from exc
+
     def update_ad(self, ad_id: str, **kwargs) -> None:
         """Обновляет поля объявления по Avito ad_id.
 
@@ -714,29 +817,28 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
+            from sqlalchemy import func, or_
+
             now = datetime.datetime.now(datetime.timezone.utc)
+
+            # Фильтрация полностью в SQL:
+            # last_run_at IS NULL (никогда не запускался)
+            # OR last_run_at + interval <= now()
             stmt = (
                 select(TrackedSearch)
-                .where(TrackedSearch.is_active.is_(True))
+                .where(
+                    TrackedSearch.is_active.is_(True),
+                    or_(
+                        TrackedSearch.last_run_at.is_(None),
+                        TrackedSearch.last_run_at + func.make_interval(
+                            0, 0, 0, 0, 0, 0,
+                            TrackedSearch.schedule_interval_hours * 3600,
+                        ) <= now,
+                    ),
+                )
                 .order_by(TrackedSearch.priority.desc())
             )
-            active = self.session.execute(stmt).scalars().all()
-
-            due = []
-            for search in active:
-                if search.last_run_at is None:
-                    due.append(search)
-                else:
-                    last_run = search.last_run_at
-                    if last_run.tzinfo is None:
-                        last_run = last_run.replace(
-                            tzinfo=datetime.timezone.utc,
-                        )
-                    interval = datetime.timedelta(
-                        hours=search.schedule_interval_hours,
-                    )
-                    if now >= last_run + interval:
-                        due.append(search)
+            due = list(self.session.execute(stmt).scalars().all())
 
             logger.debug(
                 "searches_due_for_run_fetched",

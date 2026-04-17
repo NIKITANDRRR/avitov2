@@ -1,4 +1,6 @@
-"""Скрипт заполнения БД 14 поисковыми запросами по всей России.
+"""Скрипт заполнения БД модельными поисковыми запросами из конфигурации.
+
+Данные читаются из config/products.json.
 
 Запуск:
     python -m scripts.seed_searches
@@ -8,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -26,30 +29,19 @@ from app.storage.models import (  # noqa: F401
 )
 from app.utils.helpers import build_avito_url
 
-# 14 поисковых запросов по всей России
-SEARCHES: list[str] = [
-    # iPhone (6)
-    "iPhone 15 Pro 128GB",
-    "iPhone 15 Pro 256GB",
-    "iPhone 15 Pro Max 256GB",
-    "iPhone 15 128GB",
-    "iPhone 14 Pro 128GB",
-    "iPhone 14 Pro Max 256GB",
-    # MacBook (4)
-    "MacBook Air M2",
-    "MacBook Air M3",
-    "MacBook Pro M2",
-    "MacBook Pro M3",
-    # iPad (4)
-    "iPad Pro 11 M4",
-    "iPad Pro 13 M4",
-    "iPad Air M2",
-    "iPad mini 6",
-]
+# Путь к конфигурационному файлу
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "products.json"
+
+
+def _load_products() -> list[dict]:
+    """Загрузить список модельных поисков из config/products.json."""
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    return config["model_searches"]
 
 
 def seed_searches() -> None:
-    """Создать таблицы и добавить 14 поисковых запросов по России.
+    """Создать таблицы и добавить модельные поисковые запросы из конфигурации.
 
     - Если таблиц нет — создаёт их.
     - Если поиск с таким URL уже есть — обновляет параметры.
@@ -60,7 +52,10 @@ def seed_searches() -> None:
     Base.metadata.create_all(engine)
     print("✅ Таблицы созданы/проверены")
 
-    # 2. Добавление поисковых запросов
+    # 2. Загрузка данных из конфигурации
+    products = _load_products()
+
+    # 3. Добавление поисковых запросов
     from app.storage import get_session
     from app.storage.repository import Repository
 
@@ -69,16 +64,19 @@ def seed_searches() -> None:
     try:
         added = 0
         updated = 0
-        for query in SEARCHES:
-            search_url = build_avito_url(query, "Россия")
+        for item in products:
+            query = item["search_phrase"]
+            location = item.get("location", "россия")
+            search_url = build_avito_url(query, location)
             tracked = repo.get_or_create_tracked_search(search_url)
 
             is_new = tracked.search_phrase is None
-            tracked.schedule_interval_hours = 2
-            tracked.max_ads_to_parse = 3
+            tracked.schedule_interval_hours = item.get("schedule_interval_hours", 0.5)
+            tracked.max_ads_to_parse = item.get("max_ads_to_parse", 3)
             tracked.search_phrase = query
             tracked.is_active = True
-            tracked.priority = 1
+            tracked.is_category_search = False
+            tracked.priority = item.get("priority", 1)
 
             if is_new:
                 added += 1
@@ -87,8 +85,8 @@ def seed_searches() -> None:
 
         repo.commit()
         print(
-            f"📊 Поисковые запросы: {added} добавлено, {updated} обновлено "
-            f"(всего {len(SEARCHES)})"
+            f"📊 Модельные поиски: {added} добавлено, {updated} обновлено "
+            f"(всего {len(products)})"
         )
     except Exception as exc:
         print(f"❌ Ошибка при заполнении поисков: {exc}")

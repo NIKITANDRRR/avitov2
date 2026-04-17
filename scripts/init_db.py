@@ -21,7 +21,7 @@ def _migrate_existing_db(engine) -> None:
     # Маппинг: таблица -> список (колонка, SQL-определение)
     new_columns: dict[str, list[tuple[str, str]]] = {
         "tracked_searches": [
-            ("schedule_interval_hours", "INTEGER NOT NULL DEFAULT 2"),
+            ("schedule_interval_hours", "FLOAT NOT NULL DEFAULT 0.5"),
             ("last_run_at", "TIMESTAMP"),
             ("priority", "INTEGER NOT NULL DEFAULT 0"),
             ("max_ads_to_parse", "INTEGER NOT NULL DEFAULT 3"),
@@ -59,6 +59,43 @@ def _migrate_existing_db(engine) -> None:
                 finally:
                     raw_conn.close()
 
+def _migrate_column_types(engine) -> None:
+    """Изменяет типы существующих колонок при необходимости.
+
+    Args:
+        engine: SQLAlchemy engine.
+    """
+    type_migrations: list[tuple[str, str, str]] = [
+        # (таблица, колонка, новый SQL-тип)
+        ("tracked_searches", "schedule_interval_hours", "FLOAT"),
+    ]
+
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+
+    for table_name, col_name, new_type in type_migrations:
+        if table_name not in existing_tables:
+            continue
+        existing_columns = {col["name"]: col["type"] for col in inspector.get_columns(table_name)}
+        if col_name in existing_columns:
+            current_type = str(existing_columns[col_name]).upper()
+            if "INTEGER" in current_type and "FLOAT" in new_type.upper():
+                raw_conn = engine.raw_connection()
+                try:
+                    cursor = raw_conn.cursor()
+                    cursor.execute(
+                        f'ALTER TABLE {table_name} '
+                        f'ALTER COLUMN {col_name} TYPE {new_type} '
+                        f'USING {col_name}::numeric::{new_type}'
+                    )
+                    raw_conn.commit()
+                    print(f"  Migrated {table_name}.{col_name} to {new_type}")
+                except Exception as exc:
+                    print(f"  Skip {table_name}.{col_name} type migration: {exc}")
+                finally:
+                    raw_conn.close()
+
+
 def init_db() -> None:
     """Создаёт все таблицы в базе данных на основе SQLAlchemy-моделей.
 
@@ -74,6 +111,9 @@ def init_db() -> None:
 
     # 2. Добавляем новые колонки в существующие таблицы (миграция)
     _migrate_existing_db(engine)
+
+    # 3. Миграция типов колонок (INTEGER -> FLOAT)
+    _migrate_column_types(engine)
     print("Migration check completed.")
 
 

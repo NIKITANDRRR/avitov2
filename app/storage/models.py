@@ -57,8 +57,8 @@ class TrackedSearch(Base):
     )
     search_phrase: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    schedule_interval_hours: Mapped[int] = mapped_column(
-        Integer, default=2, nullable=False,
+    schedule_interval_hours: Mapped[float] = mapped_column(
+        Float, default=0.5, nullable=False,
     )
     last_run_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,

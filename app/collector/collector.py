@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -12,7 +14,10 @@ from playwright.async_api import Error as PlaywrightError
 from app.collector.browser import BrowserManager
 from app.config.settings import Settings
 from app.utils.exceptions import CollectorError
-from app.utils.helpers import random_delay, save_html
+from app.utils.helpers import random_delay, save_html, RateLimiter
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext
 
 
 class AvitoCollector:
@@ -40,12 +45,72 @@ class AvitoCollector:
         "h1",
     ]
 
-    def __init__(self, browser_manager: BrowserManager, settings: Settings) -> None:
+    def __init__(
+        self,
+        browser_manager: BrowserManager,
+        settings: Settings,
+        rate_limiter: RateLimiter | None = None,
+        search_rate_limiter: RateLimiter | None = None,
+        ad_rate_limiter: RateLimiter | None = None,
+    ) -> None:
         self.browser = browser_manager
         self.settings = settings
+        self._rate_limiter = rate_limiter
+        self._search_rate_limiter = search_rate_limiter
+        self._ad_rate_limiter = ad_rate_limiter
         self.logger = structlog.get_logger()
 
-    async def collect_search_page(self, url: str) -> tuple[str, str]:
+    async def _navigate_with_retry(
+        self,
+        page: "Page",  # noqa: F821
+        url: str,
+        max_attempts: int | None = None,
+    ) -> None:
+        """Навигация с retry и exponential backoff.
+
+        При ошибке загрузки страницы выполняет повторные попытки
+        с нарастающей задержкой (exponential backoff + jitter).
+
+        Args:
+            page: Страница Playwright.
+            url: URL для навигации.
+            max_attempts: Максимум попыток (по умолчанию из настроек).
+
+        Raises:
+            Exception: Последняя ошибка после исчерпания всех попыток.
+        """
+        max_attempts = max_attempts or self.settings.RETRY_MAX_ATTEMPTS
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=30000,
+                )
+                return
+            except Exception as e:
+                if attempt == max_attempts:
+                    raise
+                backoff = min(
+                    self.settings.RETRY_BACKOFF_BASE * (2 ** (attempt - 1)),
+                    self.settings.RETRY_BACKOFF_MAX,
+                )
+                jitter = random.uniform(0.5, 1.5)
+                wait_time = backoff * jitter
+                self.logger.warning(
+                    "navigate_retry",
+                    url=url,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    wait_sec=round(wait_time, 2),
+                    error=str(e),
+                )
+                await asyncio.sleep(wait_time)
+
+    async def collect_search_page(
+        self,
+        url: str,
+        context: "BrowserContext | None" = None,
+    ) -> tuple[str, str]:
         """Открыть поисковую страницу и вернуть ``(html, saved_path)``.
 
         Выполняет случайную задержку перед открытием, загружает страницу,
@@ -53,6 +118,8 @@ class AvitoCollector:
 
         Args:
             url: URL поисковой страницы Avito.
+            context: Опциональный изолированный контекст браузера.
+                Если передан — страница создаётся из него.
 
         Returns:
             tuple[str, str]: Кортеж ``(html_content, path_to_saved_file)``.
@@ -60,7 +127,10 @@ class AvitoCollector:
         Raises:
             CollectorError: Если не удалось загрузить страницу.
         """
-        page = await self.browser.new_page()
+        if context is not None:
+            page = await context.new_page()
+        else:
+            page = await self.browser.new_page()
         try:
             await random_delay(
                 self.settings.MIN_DELAY_SECONDS,
@@ -69,7 +139,13 @@ class AvitoCollector:
 
             self.logger.info("collecting_search_page", url=url)
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Rate limiter: приоритет раздельному, fallback на общий
+            if self._search_rate_limiter is not None:
+                await self._search_rate_limiter.acquire()
+            elif self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
+
+            await self._navigate_with_retry(page, url)
 
             # Ожидание загрузки списка объявлений
             selector_found = await self._wait_for_selectors(
@@ -92,7 +168,7 @@ class AvitoCollector:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"search_{timestamp}"
             directory = f"{self.settings.RAW_HTML_PATH}/search"
-            saved_path = save_html(html, directory, filename)
+            saved_path = await save_html(html, directory, filename)
 
             self.logger.info(
                 "search_page_collected",
@@ -119,9 +195,9 @@ class AvitoCollector:
                 html = await page.content()
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 directory = f"{self.settings.RAW_HTML_PATH}/search"
-                save_html(html, directory, f"search_error_{timestamp}")
-            except Exception as exc:
-                self.logger.debug("save_error_html_failed", error=str(exc))
+                await save_html(html, directory, f"search_error_{timestamp}")
+            except Exception as save_exc:
+                self.logger.debug("save_error_html_failed", error=str(save_exc))
 
             raise CollectorError(
                 f"Failed to collect search page {url}: {exc}"
@@ -132,7 +208,11 @@ class AvitoCollector:
             except Exception as exc:
                 self.logger.debug("page_close_failed", error=str(exc))
 
-    async def collect_ad_page(self, url: str) -> tuple[str, str]:
+    async def collect_ad_page(
+        self,
+        url: str,
+        context: "BrowserContext | None" = None,
+    ) -> tuple[str, str]:
         """Открыть карточку объявления и вернуть ``(html, saved_path)``.
 
         Выполняет случайную задержку перед открытием, загружает страницу,
@@ -140,6 +220,8 @@ class AvitoCollector:
 
         Args:
             url: URL карточки объявления Avito.
+            context: Опциональный изолированный контекст браузера.
+                Если передан — страница создаётся из него.
 
         Returns:
             tuple[str, str]: Кортеж ``(html_content, path_to_saved_file)``.
@@ -147,7 +229,10 @@ class AvitoCollector:
         Raises:
             CollectorError: Если не удалось загрузить страницу.
         """
-        page = await self.browser.new_page()
+        if context is not None:
+            page = await context.new_page()
+        else:
+            page = await self.browser.new_page()
         try:
             await random_delay(
                 self.settings.MIN_DELAY_SECONDS,
@@ -156,7 +241,13 @@ class AvitoCollector:
 
             self.logger.info("collecting_ad_page", url=url)
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Rate limiter: приоритет раздельному, fallback на общий
+            if self._ad_rate_limiter is not None:
+                await self._ad_rate_limiter.acquire()
+            elif self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
+
+            await self._navigate_with_retry(page, url)
 
             # Ожидание загрузки карточки объявления
             selector_found = await self._wait_for_selectors(
@@ -179,7 +270,7 @@ class AvitoCollector:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"ad_{timestamp}"
             directory = f"{self.settings.RAW_HTML_PATH}/ad"
-            saved_path = save_html(html, directory, filename)
+            saved_path = await save_html(html, directory, filename)
 
             self.logger.info(
                 "ad_page_collected",
@@ -206,9 +297,9 @@ class AvitoCollector:
                 html = await page.content()
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 directory = f"{self.settings.RAW_HTML_PATH}/ad"
-                save_html(html, directory, f"ad_error_{timestamp}")
-            except Exception as exc:
-                self.logger.debug("save_error_html_failed", error=str(exc))
+                await save_html(html, directory, f"ad_error_{timestamp}")
+            except Exception as save_exc:
+                self.logger.debug("save_error_html_failed", error=str(save_exc))
 
             raise CollectorError(
                 f"Failed to collect ad page {url}: {exc}"

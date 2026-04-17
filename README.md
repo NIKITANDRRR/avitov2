@@ -17,13 +17,15 @@
 
 В проекте есть планировщик ([`app/scheduler/scheduler.py`](app/scheduler/scheduler.py)). Он работает как бесконечный цикл:
 
-- Запускает цикл сбора и анализа каждые 50 минут
-- Каждый поисковый запрос имеет свой интервал (по умолчанию 2 часа)
+- Каждый поисковый запрос имеет свой интервал (по умолчанию 0.5 часа / 30 минут)
 - Ошибки не прерывают работу планировщика
 - Поиски обрабатываются батчами по 3 параллельно через `asyncio.Semaphore`
 - **Пагинация**: обход до 50 страниц поисковой выдачи за один запуск поиска
 - **Параллельный сбор карточек**: до 5 вкладок открываются одновременно
 - Пагинация прекращается досрочно, если на странице нет новых объявлений
+- **Изоляция контекста**: каждый поиск работает в отдельном BrowserContext
+- **Раздельные rate limiter'ы**: 6 запросов/мин для поиска, 8 для карточек
+- **Retry с exponential backoff**: до 3 попыток при ошибках навигации
 
 ## Быстрый старт
 
@@ -80,7 +82,7 @@ python -m app.main run-once
 ### Управление поисками
 
 ```bash
-python -m app.main add-search "iPhone 15 Pro 128GB" --location "Москва" --interval 2 --max-ads 3 --priority 1
+python -m app.main add-search "iPhone 15 Pro 128GB" --location "Москва" --interval 0.5 --max-ads 3 --priority 1
 python -m app.main remove-search 5
 python -m app.main list-searches
 ```
@@ -166,7 +168,15 @@ data/raw_html/       # Сохранённый HTML (search/ и ad/)
 | `MAX_CONCURRENT_SEARCHES` | `3` | Макс. параллельных поисков |
 | `MAX_CONCURRENT_AD_PAGES` | `5` | Макс. параллельно открываемых карточек |
 | `MAX_SEARCH_PAGES_PER_RUN` | `50` | Макс. страниц пагинации за поиск |
-| `DEFAULT_SCHEDULE_INTERVAL_HOURS` | `2` | Интервал запуска поисков (часы) |
+| `DEFAULT_SCHEDULE_INTERVAL_HOURS` | `0.5` | Интервал запуска поисков (часы, может быть дробным) |
+| `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `3.0` / `8.0` | Диапазон задержек между действиями (сек) |
+| `SEARCH_RATE_LIMIT_PER_MINUTE` | `6` | Максимум запросов поиска в минуту |
+| `AD_RATE_LIMIT_PER_MINUTE` | `8` | Максимум запросов карточек в минуту |
+| `RETRY_MAX_ATTEMPTS` | `3` | Максимум попыток при ошибке загрузки |
+| `RETRY_BACKOFF_BASE` | `5.0` | Базовая задержка exponential backoff (сек) |
+| `USE_ISOLATED_CONTEXTS` | `true` | Отдельный контекст браузера на каждый поиск |
+| `BATCH_DELAY_SECONDS` | `30` | Задержка между батчами поисков (сек) |
+| `SEARCH_DELAY_SECONDS` | `5` | Задержка между поисками в батче (сек) |
 | `TEMPORAL_WINDOW_DAYS` | `14` | Окно анализа цен (дни) |
 | `UNDERVALUED_THRESHOLD` | `0.3` | Порог composite score |
 | `LOG_LEVEL` | `INFO` | Уровень логирования |

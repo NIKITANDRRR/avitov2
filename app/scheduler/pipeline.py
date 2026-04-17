@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import psutil
 import structlog
@@ -22,6 +24,10 @@ from app.analysis.segment_analyzer import SegmentAnalyzer, DiamondAlert, Categor
 from app.analysis.attribute_extractor import AttributeExtractor
 from app.notifier import EmailNotifier, TelegramNotifier
 from app.utils import random_delay, setup_logging, extract_ad_id_from_url, normalize_url, build_page_url
+from app.utils.helpers import RateLimiter
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext
 
 
 class Pipeline:
@@ -105,7 +111,27 @@ class Pipeline:
                 proxy_url=self.settings.PROXY_URL,
             )
             await browser_manager.start()
-            collector = AvitoCollector(browser_manager, self.settings)
+
+            # Создаём раздельные RateLimiter'ы для поиска и карточек
+            search_rate_limiter = RateLimiter(
+                max_requests=self.settings.SEARCH_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
+            ad_rate_limiter = RateLimiter(
+                max_requests=self.settings.AD_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
+            rate_limiter = RateLimiter(
+                max_requests=self.settings.REQUEST_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
+            collector = AvitoCollector(
+                browser_manager,
+                self.settings,
+                rate_limiter=rate_limiter,
+                search_rate_limiter=search_rate_limiter,
+                ad_rate_limiter=ad_rate_limiter,
+            )
 
             self.logger.info(
                 "browser_ready",
@@ -224,6 +250,33 @@ class Pipeline:
                 count=len(due_searches),
             )
 
+            # === Детекция warm-up режима ===
+            is_warmup = self._detect_warmup(due_searches)
+
+            if is_warmup:
+                effective_batch_size = self.settings.WARMUP_MAX_CONCURRENT_SEARCHES
+                effective_ad_concurrency = self.settings.WARMUP_MAX_CONCURRENT_ADS
+                search_delay = self.settings.WARMUP_SEARCH_DELAY
+
+                self.logger.info(
+                    "warmup_mode_detected",
+                    total_searches=len(due_searches),
+                    batch_size=effective_batch_size,
+                    ad_concurrency=effective_ad_concurrency,
+                    search_delay=search_delay,
+                )
+
+                # Начальная задержка при warm-up
+                self.logger.info(
+                    "warmup_initial_delay",
+                    seconds=self.settings.WARMUP_INITIAL_DELAY,
+                )
+                await asyncio.sleep(self.settings.WARMUP_INITIAL_DELAY)
+            else:
+                effective_batch_size = self.settings.MAX_CONCURRENT_SEARCHES
+                effective_ad_concurrency = self.settings.MAX_CONCURRENT_AD_PAGES
+                search_delay = self.settings.SEARCH_DELAY_SECONDS
+
             # Запуск браузера
             browser_manager = BrowserManager(
                 headless=self.settings.HEADLESS,
@@ -231,16 +284,35 @@ class Pipeline:
                 proxy_url=self.settings.PROXY_URL,
             )
             await browser_manager.start()
-            collector = AvitoCollector(browser_manager, self.settings)
+
+            # Создаём раздельные RateLimiter'ы для поиска и карточек
+            search_rate_limiter = RateLimiter(
+                max_requests=self.settings.SEARCH_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
+            ad_rate_limiter = RateLimiter(
+                max_requests=self.settings.AD_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
+            # Общий rate_limiter для обратной совместимости (legacy run)
+            rate_limiter = RateLimiter(
+                max_requests=self.settings.REQUEST_RATE_LIMIT_PER_MINUTE,
+                per_seconds=60,
+            )
+            collector = AvitoCollector(
+                browser_manager, self.settings,
+                rate_limiter=rate_limiter,
+                search_rate_limiter=search_rate_limiter,
+                ad_rate_limiter=ad_rate_limiter,
+            )
 
             try:
                 # Разбиваем на батчи
-                batch_size = self.settings.MAX_CONCURRENT_SEARCHES
-                semaphore = asyncio.Semaphore(batch_size)
+                semaphore = asyncio.Semaphore(effective_batch_size)
 
                 batches = [
-                    due_searches[i:i + batch_size]
-                    for i in range(0, len(due_searches), batch_size)
+                    due_searches[i:i + effective_batch_size]
+                    for i in range(0, len(due_searches), effective_batch_size)
                 ]
 
                 analyzer = PriceAnalyzer()
@@ -250,6 +322,7 @@ class Pipeline:
                         "pipeline_heartbeat",
                         batch_num=batch_idx + 1,
                         total_batches=len(batches),
+                        warmup=is_warmup,
                         memory_mb=round(process.memory_info().rss / 1024 / 1024, 1),
                     )
 
@@ -257,6 +330,9 @@ class Pipeline:
                     tasks = [
                         self._process_tracked_search(
                             search, collector, repo, analyzer, semaphore,
+                            is_warmup=is_warmup,
+                            ad_concurrency=effective_ad_concurrency,
+                            search_delay=search_delay,
                         )
                         for search in batch
                     ]
@@ -264,15 +340,34 @@ class Pipeline:
 
                     # Задержка между батчами (кроме последнего)
                     if batch_idx < len(batches) - 1:
+                        delay_sec = (
+                            self.settings.WARMUP_SEARCH_DELAY
+                            if is_warmup
+                            else self.settings.BATCH_DELAY_SECONDS
+                        )
                         self.logger.info(
                             "batch_delay",
-                            seconds=self.settings.BATCH_DELAY_SECONDS,
+                            seconds=delay_sec,
+                            warmup=is_warmup,
                         )
-                        await asyncio.sleep(self.settings.BATCH_DELAY_SECONDS)
+                        await asyncio.sleep(delay_sec)
 
                 # --- Анализ и уведомления для всех поисков ---
+                self.logger.info(
+                    "DEBUG_about_to_call_analyze_and_notify",
+                    searches_count=len(due_searches),
+                    searches_processed=self.stats["searches_processed"],
+                    ads_found=self.stats["ads_found"],
+                    ads_new=self.stats["ads_new"],
+                    errors=self.stats["errors"],
+                )
                 await self._analyze_and_notify_searches(
                     repo, due_searches, analyzer,
+                )
+                self.logger.info(
+                    "DEBUG_analyze_and_notify_completed",
+                    ads_undervalued=self.stats["ads_undervalued"],
+                    notifications_sent=self.stats["notifications_sent"],
                 )
 
                 # Фиксация транзакции
@@ -318,6 +413,24 @@ class Pipeline:
     # Внутренние методы
     # ------------------------------------------------------------------
 
+    def _detect_warmup(self, searches: list[TrackedSearch]) -> bool:
+        """Определить, является ли запуск «разогревочным» (первый запуск).
+
+        Warm-up detected если ВСЕ запланированные поиски имеют
+        ``last_run_at = None`` — то есть ни разу не выполнялись.
+
+        Args:
+            searches: Список отслеживаемых поисков.
+
+        Returns:
+            bool: ``True`` если нужен warm-up режим.
+        """
+        if not self.settings.WARMUP_ENABLED:
+            return False
+        if not searches:
+            return False
+        return all(s.last_run_at is None for s in searches)
+
     async def _process_tracked_search(
         self,
         search: TrackedSearch,
@@ -325,6 +438,10 @@ class Pipeline:
         repo: Repository,
         analyzer: PriceAnalyzer,
         semaphore: asyncio.Semaphore,
+        *,
+        is_warmup: bool = False,
+        ad_concurrency: int | None = None,
+        search_delay: float | None = None,
     ) -> None:
         """Обработать один отслеживаемый поиск с семафором.
 
@@ -334,23 +451,43 @@ class Pipeline:
             repo: Экземпляр репозитория.
             analyzer: Экземпляр анализатора цен.
             semaphore: Семафор для ограничения параллельности.
+            is_warmup: Флаг warm-up режима (последовательная обработка).
+            ad_concurrency: Переопределение параллельности карточек.
+            search_delay: Переопределение задержки между поисками.
         """
         async with semaphore:
             search_start = time.monotonic()
+            context = None
             try:
                 # Задержка между поисками в батче
-                await asyncio.sleep(self.settings.SEARCH_DELAY_SECONDS)
+                delay = (
+                    search_delay
+                    if search_delay is not None
+                    else self.settings.SEARCH_DELAY_SECONDS
+                )
+                await asyncio.sleep(delay)
 
                 max_ads = (
                     search.max_ads_to_parse
                     or self.settings.DEFAULT_MAX_ADS_TO_PARSE
                 )
 
+                # Изоляция контекста: отдельный BrowserContext на каждый поиск
+                if self.settings.USE_ISOLATED_CONTEXTS:
+                    context = await collector.browser.create_context()
+                    self.logger.debug(
+                        "isolated_context_created_for_search",
+                        search_id=search.id,
+                    )
+
                 await self._process_search(
                     search.search_url,
                     collector,
                     repo,
                     max_ads=max_ads,
+                    is_warmup=is_warmup,
+                    ad_concurrency=ad_concurrency,
+                    context=context,
                 )
 
                 # Обновляем last_run_at
@@ -360,6 +497,7 @@ class Pipeline:
                 self.logger.info(
                     "search_processed",
                     search_url=search.search_url,
+                    warmup=is_warmup,
                     duration_seconds=round(time.monotonic() - search_start, 1),
                 )
 
@@ -371,6 +509,9 @@ class Pipeline:
                     search_url=search.search_url,
                     error=str(exc),
                 )
+            finally:
+                if context is not None:
+                    await collector.browser.close_context(context)
 
     async def _process_search(
         self,
@@ -378,6 +519,10 @@ class Pipeline:
         collector: AvitoCollector,
         repo: Repository,
         max_ads: int | None = None,
+        *,
+        is_warmup: bool = False,
+        ad_concurrency: int | None = None,
+        context: "BrowserContext | None" = None,
     ) -> list[str]:
         """Обработать один поисковый URL с пагинацией.
 
@@ -397,6 +542,9 @@ class Pipeline:
             repo: Экземпляр репозитория.
             max_ads: Максимум объявлений для обработки.
                 Если ``None`` — берётся из настроек.
+            is_warmup: Флаг warm-up режима (последовательная обработка карточек).
+            ad_concurrency: Переопределение параллельности карточек.
+            context: Опциональный изолированный контекст браузера.
 
         Returns:
             list[str]: Список ``ad_id`` новых обработанных объявлений.
@@ -424,10 +572,13 @@ class Pipeline:
             # Счётчик ошибок через список (mutable для замыкания)
             run_errors_counter = [0]
 
-            # Семфор для параллельного сбора карточек
-            ad_semaphore = asyncio.Semaphore(
-                self.settings.MAX_CONCURRENT_AD_PAGES,
+            # Семафор для параллельного сбора карточек
+            effective_ad_concurrency = (
+                ad_concurrency
+                if ad_concurrency is not None
+                else self.settings.MAX_CONCURRENT_AD_PAGES
             )
+            ad_semaphore = asyncio.Semaphore(effective_ad_concurrency)
 
             async def _process_ad_safe(
                 item: SearchResultItem,
@@ -437,6 +588,7 @@ class Pipeline:
                     try:
                         return await self._process_ad(
                             item, search_url, collector, repo,
+                            context=context,
                         )
                     except Exception as exc:
                         run_errors_counter[0] += 1
@@ -454,11 +606,7 @@ class Pipeline:
             for page_num in range(1, max_pages + 1):
                 page_url = build_page_url(search_url, page_num)
 
-                # Задержка перед сбором страницы
-                await random_delay(
-                    self.settings.MIN_DELAY_SECONDS,
-                    self.settings.MAX_DELAY_SECONDS,
-                )
+                # Задержка уже присутствует внутри collector.collect_search_page()
 
                 self.logger.info(
                     "collecting_search_page",
@@ -470,7 +618,7 @@ class Pipeline:
 
                 try:
                     html, _html_path = await collector.collect_search_page(
-                        page_url,
+                        page_url, context=context,
                     )
                 except Exception as exc:
                     self.logger.warning(
@@ -481,8 +629,8 @@ class Pipeline:
                     )
                     run_errors += 1
                     self.stats["errors"] += 1
-                    # Прерываем пагинацию при ошибке загрузки
-                    break
+                    # Пропускаем страницу при ошибке загрузки, продолжаем пагинацию
+                    continue
 
                 pages_fetched += 1
 
@@ -518,14 +666,25 @@ class Pipeline:
 
                 all_search_items.extend(search_items)
 
-                # Фильтрация уже известных
+                # Фильтрация уже известных (batch-обработка)
                 new_on_page: list[SearchResultItem] = []
+                pending_items: list[tuple[SearchResultItem, str]] = []
+                batch_items: list[dict] = []
                 for item in search_items:
                     ad_id = extract_ad_id_from_url(item.url)
                     if ad_id not in recent_ids:
-                        _, created = repo.get_or_create_ad(
-                            ad_id, normalize_url(item.url), search_url,
-                        )
+                        pending_items.append((item, ad_id))
+                        batch_items.append({
+                            "ad_id": ad_id,
+                            "url": normalize_url(item.url),
+                            "search_url": search_url,
+                        })
+
+                if batch_items:
+                    batch_results = repo.batch_get_or_create_ads(batch_items)
+                    for (item, ad_id), (_, created) in zip(
+                        pending_items, batch_results,
+                    ):
                         if created:
                             new_on_page.append(item)
                             recent_ids.add(ad_id)
@@ -566,20 +725,60 @@ class Pipeline:
                 new_ads=run_ads_new,
             )
 
-            # Параллельная обработка карточек с семафором
+            # Обработка карточек: warm-up → последовательно, иначе → параллельно
             if new_items:
-                ad_results = await asyncio.gather(
-                    *[_process_ad_safe(item) for item in new_items],
-                    return_exceptions=True,
-                )
+                if is_warmup:
+                    # Последовательная обработка карточек с задержками (warm-up)
+                    self.logger.info(
+                        "warmup_sequential_ad_processing",
+                        search_url=search_url,
+                        ad_count=len(new_items),
+                    )
+                    for item in new_items:
+                        try:
+                            result = await self._process_ad(
+                                item, search_url, collector, repo,
+                                context=context,
+                            )
+                            if result is not None:
+                                new_ad_ids.append(result)
+                                run_ads_opened += 1
+                        except Exception as exc:
+                            run_errors += 1
+                            self.stats["errors"] += 1
+                            self.logger.error(
+                                "warmup_ad_processing_failed",
+                                url=item.url,
+                                error=str(exc),
+                            )
 
-                for result in ad_results:
-                    if isinstance(result, Exception):
-                        run_errors += 1
-                        self.stats["errors"] += 1
-                    elif result is not None:
-                        new_ad_ids.append(result)
-                        run_ads_opened += 1
+                        # Задержка между карточками при warm-up
+                        delay = random.uniform(
+                            self.settings.WARMUP_AD_DELAY_MIN,
+                            self.settings.WARMUP_AD_DELAY_MAX,
+                        )
+                        self.logger.debug(
+                            "warmup_ad_delay",
+                            delay_sec=round(delay, 2),
+                        )
+                        await asyncio.sleep(delay)
+                else:
+                    # Параллельная обработка (обычный режим)
+                    ad_results = await asyncio.gather(
+                        *[_process_ad_safe(item) for item in new_items],
+                        return_exceptions=True,
+                    )
+
+                    for result in ad_results:
+                        if isinstance(result, Exception):
+                            # Недостижимо: _process_ad_safe ловит все
+                            # исключения и возвращает None, но оставляем
+                            # защиту на случай изменения поведения.
+                            run_errors += 1
+                            self.stats["errors"] += 1
+                        elif result is not None:
+                            new_ad_ids.append(result)
+                            run_ads_opened += 1
 
             run_errors += run_errors_counter[0]
 
@@ -635,6 +834,8 @@ class Pipeline:
         search_url: str,
         collector: AvitoCollector,
         repo: Repository,
+        *,
+        context: "BrowserContext | None" = None,
     ) -> str | None:
         """Обработать одну карточку объявления.
 
@@ -649,6 +850,7 @@ class Pipeline:
             search_url: URL поискового запроса.
             collector: Экземпляр сборщика.
             repo: Экземпляр репозитория.
+            context: Опциональный изолированный контекст браузера.
 
         Returns:
             str | None: ``ad_id`` при успехе или ``None`` при ошибке.
@@ -658,14 +860,12 @@ class Pipeline:
 
         savepoint = repo.session.begin_nested()
         try:
-            # Задержка перед сбором
-            await random_delay(
-                self.settings.MIN_DELAY_SECONDS,
-                self.settings.MAX_DELAY_SECONDS,
-            )
+            # Задержка уже присутствует внутри collector.collect_ad_page()
 
             # Сбор карточки
-            html, html_path = await collector.collect_ad_page(normalized_url)
+            html, html_path = await collector.collect_ad_page(
+                normalized_url, context=context,
+            )
             self.stats["ads_scraped"] += 1
 
             # Парсинг
@@ -858,6 +1058,13 @@ class Pipeline:
         analyze_start = time.monotonic()
         all_undervalued: list[UndervaluedAd] = []
 
+        self.logger.info(
+            "DEBUG_analyze_and_notify_searches_started",
+            searches_count=len(searches),
+            search_urls=[s.search_url for s in searches],
+            is_category_flags=[getattr(s, 'is_category_search', False) for s in searches],
+        )
+
         accessory_filter = AccessoryFilter(
             blacklist=self.settings.ACCESSORY_BLACKLIST,
             min_price=self.settings.MIN_PRICE_FILTER,
@@ -901,6 +1108,12 @@ class Pipeline:
                 ads = repo.get_ads_for_analysis(
                     search.search_url,
                     days=self.settings.TEMPORAL_WINDOW_DAYS,
+                )
+                self.logger.info(
+                    "DEBUG_ads_for_analysis_result",
+                    search_url=search.search_url,
+                    ads_count=len(ads),
+                    temporal_window_days=self.settings.TEMPORAL_WINDOW_DAYS,
                 )
                 if not ads:
                     self.logger.info(
@@ -1188,7 +1401,11 @@ class Pipeline:
                 continue
 
             # Ищем «бриллианты» среди объявлений этого сегмента
-            for ad in filtered_ads:
+            segment_ads = [
+                ad for ad in filtered_ads
+                if segment_analyzer.build_segment_key(ad).to_string() == segment_key_str
+            ]
+            for ad in segment_ads:
                 if ad.price is None or ad.price <= 0:
                     continue
                 diamond = self._check_diamond_candidate(
@@ -1402,18 +1619,22 @@ class Pipeline:
     ) -> None:
         """Отправить уведомления о недооценённых объявлениях.
 
-        Сначала пробует Telegram, при неудаче — email (fallback).
+        Отправляет уведомления через два параллельных канала:
+        Telegram и Email — независимо друг от друга.
 
         Args:
             all_undervalued: Список недооценённых объявлений.
             repo: Экземпляр репозитория.
         """
+        self.logger.info(
+            "DEBUG_send_notifications_called",
+            undervalued_count=len(all_undervalued),
+        )
         if not all_undervalued:
             self.logger.info("no_undervalued_ads_to_notify")
             return
 
-        # Сначала пробуем Telegram
-        telegram_ok = False
+        # Канал 1: Telegram
         try:
             notifier = TelegramNotifier()
             results = await notifier.send_undervalued_notifications(
@@ -1430,37 +1651,31 @@ class Pipeline:
                 failed=len(results) - sent_count,
             )
 
-            if sent_count > 0:
-                telegram_ok = True
-
         except Exception as exc:
             self.logger.error(
                 "telegram_notifications_failed",
                 error=str(exc),
             )
 
-        # Если Telegram не сработал — пробуем email (fallback)
-        if not telegram_ok:
-            self.logger.info("falling_back_to_email")
-            try:
-                email_notifier = EmailNotifier()
-                results = await email_notifier.send_undervalued_notifications(
-                    all_undervalued, repo,
-                )
-                sent_count = sum(1 for r in results if r.success)
-                self.stats["notifications_sent"] = sent_count
+        # Канал 2: Email — отправляем всегда (параллельный канал)
+        try:
+            email_notifier = EmailNotifier()
+            results = await email_notifier.send_undervalued_notifications(
+                all_undervalued, repo,
+            )
+            email_count = sum(1 for r in results if r.success)
 
-                self.logger.info(
-                    "notifications_sent",
-                    channel="email",
-                    total_undervalued=len(all_undervalued),
-                    sent=sent_count,
-                    failed=len(results) - sent_count,
-                )
+            self.logger.info(
+                "notifications_sent",
+                channel="email",
+                total_undervalued=len(all_undervalued),
+                sent=email_count,
+                failed=len(results) - email_count,
+            )
 
-            except Exception as exc:
-                self.stats["errors"] += 1
-                self.logger.error(
-                    "email_notifications_failed",
-                    error=str(exc),
-                )
+        except Exception as exc:
+            self.stats["errors"] += 1
+            self.logger.error(
+                "email_notifications_failed",
+                error=str(exc),
+            )

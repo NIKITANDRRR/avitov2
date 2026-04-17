@@ -22,7 +22,7 @@ app = typer.Typer(
 def add_search(
     query: str = typer.Argument(..., help="Поисковый запрос (например: 'iPhone 15 Pro')"),
     location: str = typer.Option("Москва", "--location", "-l", help="Город/регион поиска"),
-    interval: int = typer.Option(2, "--interval", "-i", help="Интервал запуска (часы)"),
+    interval: float = typer.Option(0.5, "--interval", "-i", help="Интервал запуска (часы, может быть дробным)"),
     max_ads: int = typer.Option(3, "--max-ads", "-m", help="Карточек на поиск за запуск"),
     priority: int = typer.Option(1, "--priority", "-p", help="Приоритет (1-10, ниже = важнее)"),
 ) -> None:
@@ -356,46 +356,38 @@ def _ensure_tables() -> None:
 
 
 def _seed_searches() -> None:
-    """Добавить 14 поисковых запросов по всей России (если их нет)."""
+    """Загрузка модельных поисков из config/products.json."""
+    import json
+    from pathlib import Path
+
     from app.storage import get_session
     from app.storage.repository import Repository
     from app.utils.helpers import build_avito_url
 
-    SEARCHES = [
-        # iPhone (6)
-        "iPhone 15 Pro 128GB",
-        "iPhone 15 Pro 256GB",
-        "iPhone 15 Pro Max 256GB",
-        "iPhone 15 128GB",
-        "iPhone 14 Pro 128GB",
-        "iPhone 14 Pro Max 256GB",
-        # MacBook (4)
-        "MacBook Air M2",
-        "MacBook Air M3",
-        "MacBook Pro M2",
-        "MacBook Pro M3",
-        # iPad (4)
-        "iPad Pro 11 M4",
-        "iPad Pro 13 M4",
-        "iPad Air M2",
-        "iPad mini 6",
-    ]
+    config_path = Path(__file__).parent.parent.parent / "config" / "products.json"
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    products = config["model_searches"]
 
     session = get_session()
     repo = Repository(session)
     try:
         added = 0
         updated = 0
-        for query in SEARCHES:
-            search_url = build_avito_url(query, "Россия")
+        for item in products:
+            query = item["search_phrase"]
+            location = item.get("location", "россия")
+            search_url = build_avito_url(query, location)
             tracked = repo.get_or_create_tracked_search(search_url)
 
             is_new = tracked.search_phrase is None
-            tracked.schedule_interval_hours = 2
-            tracked.max_ads_to_parse = 3
+            tracked.schedule_interval_hours = item.get("schedule_interval_hours", 0.5)
+            tracked.max_ads_to_parse = item.get("max_ads_to_parse", 3)
             tracked.search_phrase = query
             tracked.is_active = True
-            tracked.priority = 1
+            tracked.is_category_search = False
+            tracked.priority = item.get("priority", 1)
 
             if is_new:
                 added += 1
@@ -404,8 +396,8 @@ def _seed_searches() -> None:
 
         repo.commit()
         typer.echo(
-            f"[STATS] Поисковые запросы: {added} добавлено, {updated} обновлено "
-            f"(всего {len(SEARCHES)})"
+            f"[STATS] Модельные поиски: {added} добавлено, {updated} обновлено "
+            f"(всего {len(products)})"
         )
     except Exception as exc:
         typer.echo(f"❌ Ошибка при заполнении поисков: {exc}", err=True)
@@ -415,61 +407,42 @@ def _seed_searches() -> None:
 
 
 def _seed_category_searches() -> None:
-    """Добавить категорийные поиски (телефоны, ноутбуки, велосипеды, шины)."""
+    """Загрузка категорийных поисков из config/categories.json."""
+    import json
+    from pathlib import Path
+
     from app.storage import get_session
     from app.storage.repository import Repository
 
-    CATEGORY_SEARCHES = [
-        {
-            "search_url": "https://www.avito.ru/rossiya/telefony",
-            "search_phrase": "Телефоны (широкая лента)",
-            "category": "телефоны",
-            "schedule_interval_hours": 2,
-            "max_ads_to_parse": 20,
-            "priority": 10,
-        },
-        {
-            "search_url": "https://www.avito.ru/rossiya/noutbuki",
-            "search_phrase": "Ноутбуки (широкая лента)",
-            "category": "ноутбуки",
-            "schedule_interval_hours": 3,
-            "max_ads_to_parse": 15,
-            "priority": 8,
-        },
-        {
-            "search_url": "https://www.avito.ru/rossiya/velosipedy",
-            "search_phrase": "Велосипеды (широкая лента)",
-            "category": "велосипеды",
-            "schedule_interval_hours": 4,
-            "max_ads_to_parse": 20,
-            "priority": 7,
-        },
-        {
-            "search_url": "https://www.avito.ru/rossiya/shiny",
-            "search_phrase": "Шины (широкая лента)",
-            "category": "шины",
-            "schedule_interval_hours": 3,
-            "max_ads_to_parse": 20,
-            "priority": 7,
-        },
-    ]
+    config_path = Path(__file__).parent.parent.parent / "config" / "categories.json"
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    category_searches = config["category_searches"]
 
     session = get_session()
     repo = Repository(session)
     try:
         created = 0
         skipped = 0
-        for data in CATEGORY_SEARCHES:
+        for data in category_searches:
             existing = repo.get_or_create_tracked_search(data["search_url"])
 
-            if existing.search_phrase is None or getattr(existing, "search_type", None) == "model":
-                existing.search_type = "category"  # type: ignore[attr-defined]
+            if existing.search_phrase is None or not existing.is_category_search:
+                existing.is_category_search = True
                 existing.search_phrase = data["search_phrase"]
                 existing.category = data["category"]  # type: ignore[attr-defined]
                 existing.schedule_interval_hours = data["schedule_interval_hours"]
                 existing.max_ads_to_parse = data["max_ads_to_parse"]
                 existing.priority = data["priority"]
                 existing.is_active = True
+                # Дополнительные поля из конфигурации
+                if "location" in data:
+                    existing.location = data["location"]  # type: ignore[attr-defined]
+                if "owner_type" in data:
+                    existing.owner_type = data["owner_type"]  # type: ignore[attr-defined]
+                if "min_price" in data:
+                    existing.min_price = data["min_price"]  # type: ignore[attr-defined]
                 created += 1
             else:
                 skipped += 1
@@ -477,7 +450,7 @@ def _seed_category_searches() -> None:
         repo.commit()
         typer.echo(
             f"[STATS] Категорийные поиски: {created} создано, {skipped} пропущено "
-            f"(всего {len(CATEGORY_SEARCHES)})"
+            f"(всего {len(category_searches)})"
         )
     except Exception as exc:
         typer.echo(f"❌ Ошибка при заполнении категорийных поисков: {exc}", err=True)

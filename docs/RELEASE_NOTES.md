@@ -1,6 +1,36 @@
-# Release Notes — Категорийный мониторинг
+# Release Notes — Avito Price Monitor
 
-## [Unreleased] - 2026-04-15
+## [Unreleased] - 2026-04-17
+
+### Оптимизация производительности парсера
+
+#### Added
+- **Изоляция контекста браузера**: каждый поиск работает в отдельном `BrowserContext` (настройка `USE_ISOLATED_CONTEXTS`)
+- **Раздельные rate limiter'ы**: независимые лимиты для поиска (6/мин) и карточек (8/мин) (`SEARCH_RATE_LIMIT_PER_MINUTE`, `AD_RATE_LIMIT_PER_MINUTE`)
+- **Retry с exponential backoff**: до 3 попыток при ошибках навигации с задержкой 5→10→20 сек (`RETRY_MAX_ATTEMPTS`, `RETRY_BACKOFF_BASE`, `RETRY_BACKOFF_MAX`)
+- **Batch-операции с БД**: `batch_get_or_create_ads()` для массового создания/обновления объявлений
+- **Асинхронная запись HTML**: `asyncio.to_thread()` для неблокирующего сохранения HTML-файлов
+
+#### Changed
+- **Задержки уменьшены**: 3–8 сек вместо 5–15 сек (`MIN_DELAY_SECONDS`: 5→3, `MAX_DELAY_SECONDS`: 15→8)
+- **`DEFAULT_SCHEDULE_INTERVAL_HOURS`**: тип изменён с `int` на `float`, default 2→0.5 (30 мин)
+- **`schedule_interval_hours` в БД**: тип колонки изменён с `INTEGER` на `FLOAT` (миграция в `init_db.py`)
+- **`make_interval` в SQL**: использует секунды (`hours * 3600`) для поддержки дробных часов
+- **CLI `add-search`**: параметр `--interval` теперь `float` (default 0.5)
+
+#### New Settings
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `SEARCH_RATE_LIMIT_PER_MINUTE` | `6` | Максимум запросов поиска в минуту |
+| `AD_RATE_LIMIT_PER_MINUTE` | `8` | Максимум запросов карточек в минуту |
+| `RETRY_MAX_ATTEMPTS` | `3` | Максимум попыток при ошибке загрузки |
+| `RETRY_BACKOFF_BASE` | `5.0` | Базовая задержка exponential backoff (сек) |
+| `RETRY_BACKOFF_MAX` | `60.0` | Максимальная задержка retry (сек) |
+| `USE_ISOLATED_CONTEXTS` | `true` | Создавать отдельный контекст браузера на каждый поиск |
+
+---
+
+## [2026-04-15]
 
 ### Added
 - **Параллельный сбор карточек**: до 5 вкладок открываются одновременно через `asyncio.Semaphore` (настройка `MAX_CONCURRENT_AD_PAGES`)

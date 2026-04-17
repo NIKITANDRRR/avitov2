@@ -1,7 +1,7 @@
 # Архитектура Avito Price Monitor
 
-> **Версия:** 3.0
-> **Дата:** 2026-04-14
+> **Версия:** 3.1
+> **Дата:** 2026-04-17
 
 ---
 
@@ -55,11 +55,16 @@
 | Параметр | Значение | Источник |
 |---|---|---|
 | Интервал проверки | 50 мин | Хардкод в [`scheduler.py`](app/scheduler/scheduler.py:53) |
-| Интервал запуска поиска | 2 ч (по умолч.) | `schedule_interval_hours` в БД |
+| Интервал запуска поиска | 0.5 ч (по умолч.) | `schedule_interval_hours` в БД (Float) |
 | Параллельность | 3 поиска одновременно | `MAX_CONCURRENT_SEARCHES` |
 | Параллельные карточки | 5 вкладок одновременно | `MAX_CONCURRENT_AD_PAGES` |
 | Пагинация поиска | до 50 страниц | `MAX_SEARCH_PAGES_PER_RUN` |
 | Задержка между батчами | 30 сек | `BATCH_DELAY_SECONDS` |
+| Задержки между действиями | 3–8 сек | `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` |
+| Rate limiter поиска | 6 запросов/мин | `SEARCH_RATE_LIMIT_PER_MINUTE` |
+| Rate limiter карточек | 8 запросов/мин | `AD_RATE_LIMIT_PER_MINUTE` |
+| Retry при ошибках | до 3 попыток | `RETRY_MAX_ATTEMPTS` |
+| Изоляция контекста | отдельный контекст на поиск | `USE_ISOLATED_CONTEXTS` |
 
 ### 2.3 Сборщик (Collector)
 
@@ -110,7 +115,7 @@
 | `search_url` | String(2048) | URL поисковой выдачи Avito (unique) |
 | `search_phrase` | String(512) | Человекочитаемое название |
 | `is_active` | Boolean | Флаг активности |
-| `schedule_interval_hours` | Integer | Интервал запуска (по умолч. 2 ч.) |
+| `schedule_interval_hours` | Float | Интервал запуска (по умолч. 0.5 ч., может быть дробным) |
 | `last_run_at` | DateTime | Время последнего запуска |
 | `priority` | Integer | Приоритет (1–10, ниже = важнее) |
 | `max_ads_to_parse` | Integer | Карточек за запуск (по умолч. 3) |
@@ -290,8 +295,14 @@ score = 0.4 × IQR_компонент + 0.3 × Z-score_компонент + 0.3 
 |---|---|---|---|
 | **БД** | `DATABASE_URL` | `postgresql://avito:avito@localhost:5432/avito_monitor` | URL PostgreSQL |
 | **Сбор** | `MAX_ADS_PER_SEARCH_PER_RUN` | `3` | Карточек за поиск за запуск |
-| **Задержки** | `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `5` / `15` | Антибан-задержки (сек) |
+| **Задержки** | `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `3.0` / `8.0` | Антибан-задержки (сек) |
 | **Браузер** | `HEADLESS` | `false` | Headless-режим |
+| **Rate limit** | `SEARCH_RATE_LIMIT_PER_MINUTE` | `6` | Максимум запросов поиска в минуту |
+| **Rate limit** | `AD_RATE_LIMIT_PER_MINUTE` | `8` | Максимум запросов карточек в минуту |
+| **Retry** | `RETRY_MAX_ATTEMPTS` | `3` | Максимум попыток при ошибке загрузки |
+| **Retry** | `RETRY_BACKOFF_BASE` | `5.0` | Базовая задержка exponential backoff (сек) |
+| **Контекст** | `USE_ISOLATED_CONTEXTS` | `true` | Отдельный контекст браузера на каждый поиск |
+| **Интервал** | `DEFAULT_SCHEDULE_INTERVAL_HOURS` | `0.5` | Интервал запуска поисков (часы, float) |
 | **Анализ** | `TEMPORAL_WINDOW_DAYS` | `14` | Окно анализа (дни) |
 | **Анализ** | `UNDERVALUED_THRESHOLD` | `0.3` | Порог composite score |
 | **Анализ** | `MEDIAN_DISCOUNT_THRESHOLD` | `0.85` | Порог % от медианы |
@@ -337,7 +348,7 @@ python -m app.main run-once
 ### Управление поисками
 
 ```bash
-python -m app.main add-search "iPhone 15 Pro 128GB" --location "Москва" --interval 2
+python -m app.main add-search "iPhone 15 Pro 128GB" --location "Москва" --interval 0.5
 python -m app.main list-searches
 python -m app.main remove-search 5
 ```

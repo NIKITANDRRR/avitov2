@@ -899,7 +899,7 @@ class SegmentAnalyzer:
                     if h.snapshot_date >= cutoff.date() and h.median_price and h.median_price > 0
                 ]
                 if window_prices:
-                    median_val = sorted(window_prices)[len(window_prices) // 2]
+                    median_val = float(statistics.median(window_prices))
                     result[f'median_{window}d'] = median_val
 
             # Частота появления

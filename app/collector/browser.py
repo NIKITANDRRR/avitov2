@@ -115,6 +115,71 @@ class BrowserManager:
 
         return kwargs
 
+    async def create_context(self) -> "BrowserContext":
+        """Создать изолированный контекст браузера с уникальным fingerprint.
+
+        Каждый вызов создаёт новый ``BrowserContext`` с рандомизированным
+        viewport и user-agent, а также добавляет anti-detection скрипт.
+        Используется для изоляции поисковых запросов друг от друга.
+
+        Returns:
+            BrowserContext: Новый изолированный контекст браузера.
+
+        Raises:
+            CollectorError: Если не удалось создать контекст.
+        """
+        from app.utils.exceptions import CollectorError
+
+        try:
+            if self._browser is None:
+                await self.start()
+
+            assert self._browser is not None  # для type checker
+
+            viewport = {
+                "width": random.randint(1280, 1920),
+                "height": random.randint(720, 1080),
+            }
+            user_agent = random.choice(USER_AGENTS)
+            context = await self._browser.new_context(
+                viewport=viewport,
+                user_agent=user_agent,
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+            )
+
+            # Anti-detection: скрыть navigator.webdriver
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', "
+                "{get: () => undefined});"
+            )
+
+            self.logger.debug(
+                "isolated_context_created",
+                viewport=viewport,
+                user_agent=user_agent[:50],
+            )
+            return context
+        except Exception as exc:
+            raise CollectorError(
+                f"Failed to create isolated context: {exc}"
+            ) from exc
+
+    async def close_context(self, context: "BrowserContext") -> None:
+        """Закрыть контекст браузера.
+
+        Args:
+            context: Контекст браузера для закрытия.
+        """
+        if context is not None:
+            try:
+                await context.close()
+                self.logger.debug("isolated_context_closed")
+            except Exception as exc:
+                self.logger.warning(
+                    "context_close_error", error=str(exc),
+                )
+
     async def new_page(self) -> Page:
         """Создать новую страницу с anti-detection настройками.
 

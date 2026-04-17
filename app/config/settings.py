@@ -65,8 +65,14 @@ class Settings(BaseSettings):
     MAX_ADS_PER_SEARCH_PER_RUN: int = Field(default=3, ge=1, le=10)
 
     # Delays (seconds)
-    MIN_DELAY_SECONDS: float = Field(default=5.0, ge=1.0)
-    MAX_DELAY_SECONDS: float = Field(default=15.0, ge=1.0)
+    MIN_DELAY_SECONDS: float = Field(
+        default=3.0, ge=1.0,
+        description="Минимальная задержка между запросами (сек)",
+    )
+    MAX_DELAY_SECONDS: float = Field(
+        default=8.0, ge=1.0,
+        description="Максимальная задержка между запросами (сек)",
+    )
     STARTUP_DELAY_MIN: float = Field(default=0.0, ge=0.0)
     STARTUP_DELAY_MAX: float = Field(default=30.0, ge=0.0)
 
@@ -200,9 +206,9 @@ class Settings(BaseSettings):
         le=10,
         description="Макс. параллельно открываемых карточек объявлений",
     )
-    DEFAULT_SCHEDULE_INTERVAL_HOURS: int = Field(
-        default=2,
-        ge=1,
+    DEFAULT_SCHEDULE_INTERVAL_HOURS: float = Field(
+        default=0.5,
+        ge=0.5,
         le=48,
         description="Интервал запуска по умолчанию (часы)",
     )
@@ -221,6 +227,88 @@ class Settings(BaseSettings):
         default=5,
         ge=0,
         description="Задержка между поисками в батче (сек)",
+    )
+
+    # === Warm-up режим (первый запуск) ===
+    WARMUP_ENABLED: bool = Field(
+        default=True,
+        description="Включить режим разогрева при первом запуске (все поиски 'new')",
+    )
+    WARMUP_INITIAL_DELAY: float = Field(
+        default=60.0,
+        ge=10.0,
+        description="Начальная задержка перед первым запросом при warm-up (сек)",
+    )
+    WARMUP_SEARCH_DELAY: float = Field(
+        default=30.0,
+        ge=5.0,
+        description="Задержка между поисками при warm-up (сек)",
+    )
+    WARMUP_AD_DELAY_MIN: float = Field(
+        default=10.0,
+        ge=3.0,
+        description="Мин. задержка между карточками при warm-up (сек)",
+    )
+    WARMUP_AD_DELAY_MAX: float = Field(
+        default=20.0,
+        ge=5.0,
+        description="Макс. задержка между карточками при warm-up (сек)",
+    )
+    WARMUP_MAX_CONCURRENT_SEARCHES: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Макс. параллельных поисков при warm-up",
+    )
+    WARMUP_MAX_CONCURRENT_ADS: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="Макс. параллельных карточек при warm-up",
+    )
+    REQUEST_RATE_LIMIT_PER_MINUTE: int = Field(
+        default=10,
+        ge=1,
+        le=30,
+        description="Макс. запросов в минуту глобально",
+    )
+
+    # === Раздельные rate limiter'ы ===
+    SEARCH_RATE_LIMIT_PER_MINUTE: int = Field(
+        default=6,
+        ge=1,
+        le=30,
+        description="Максимум запросов поиска в минуту",
+    )
+    AD_RATE_LIMIT_PER_MINUTE: int = Field(
+        default=8,
+        ge=1,
+        le=30,
+        description="Максимум запросов карточек в минуту",
+    )
+
+    # === Настройки retry ===
+    RETRY_MAX_ATTEMPTS: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Максимум попыток при ошибке загрузки",
+    )
+    RETRY_BACKOFF_BASE: float = Field(
+        default=5.0,
+        ge=1.0,
+        description="Базовая задержка для exponential backoff (сек)",
+    )
+    RETRY_BACKOFF_MAX: float = Field(
+        default=60.0,
+        ge=10.0,
+        description="Максимальная задержка retry (сек)",
+    )
+
+    # === Настройки изоляции контекста ===
+    USE_ISOLATED_CONTEXTS: bool = Field(
+        default=True,
+        description="Создавать отдельный контекст браузера на каждый поиск",
     )
 
     # --- Segment Analysis Settings ---

@@ -1,0 +1,44 @@
+{
+  "category_searches": [
+    {
+      "search_url": "https://www.avito.ru/chelyabinsk/audio_i_video/televizory_i_proektory",
+      "search_phrase": "Телевизоры (широкая лента)",
+      "category": "телевизоры",
+      "location": "челябинск",
+      "owner_type": "частное",
+      "schedule_interval_hours": 3,
+      "max_ads_to_parse": 20,
+      "priority": 8
+    },
+    {
+      "search_url": "https://www.avito.ru/chelyabinsk/velosipedy",
+      "search_phrase": "Велосипеды (широкая лента)",
+      "category": "велосипеды",
+      "location": "челябинск",
+      "owner_type": "частное",
+      "schedule_interval_hours": 4,
+      "max_ads_to_parse": 20,
+      "priority": 7
+    },
+    {
+      "search_url": "https://www.avito.ru/chelyabinsk/audio_i_video/akustika_kolonki_sabvufery",
+      "search_phrase": "Акустика, саундбары (широкая лента)",
+      "category": "саундбары",
+      "location": "челябинск",
+      "owner_type": "частное",
+      "schedule_interval_hours": 3,
+      "max_ads_to_parse": 20,
+      "priority": 8
+    },
+    {
+      "search_url": "https://www.avito.ru/all/tovary_dlya_kompyutera/tv-tyunery",
+      "search_phrase": "ТВ приставки от 10 000₽",
+      "category": "тв приставки",
+      "location": "россия",
+      "min_price": 10000,
+      "schedule_interval_hours": 2,
+      "max_ads_to_parse": 20,
+      "priority": 10
+    }
+  ]
+}

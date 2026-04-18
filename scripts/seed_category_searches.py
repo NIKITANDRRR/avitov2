@@ -16,7 +16,8 @@ from app.storage.models import TrackedSearch
 from app.storage import get_session, Repository
 
 # Путь к конфигурационному файлу
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "categories.json"
+from app.config.settings import get_settings
+_CONFIG_PATH = Path(get_settings().CATEGORIES_CONFIG_PATH)
 
 
 def _load_categories() -> list[dict]:

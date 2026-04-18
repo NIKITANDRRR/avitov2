@@ -94,7 +94,7 @@ class AvitoCollector:
         for attempt in range(1, max_attempts + 1):
             try:
                 await page.goto(
-                    url, wait_until="domcontentloaded", timeout=30000,
+                    url, wait_until="domcontentloaded", timeout=self.settings.PAGE_NAVIGATION_TIMEOUT_MS,
                 )
                 return
             except Exception as e:
@@ -159,7 +159,7 @@ class AvitoCollector:
 
             # Ожидание загрузки списка объявлений
             selector_found = await self._wait_for_selectors(
-                page, self._SEARCH_SELECTORS, timeout=15000,
+                page, self._SEARCH_SELECTORS, timeout=self.settings.SELECTOR_WAIT_TIMEOUT_MS,
             )
             if not selector_found:
                 self.logger.warning(
@@ -182,12 +182,12 @@ class AvitoCollector:
                     url=url,
                     consecutive_captchas=self._consecutive_captchas,
                 )
-                if self._consecutive_captchas >= 3:
+                if self._consecutive_captchas >= self.settings.MAX_CONSECUTIVE_CAPTCHAS:
                     raise CollectorError(
                         "Слишком много последовательных капч (>= 3). "
                         "Остановка цикла сбора."
                     )
-                await asyncio.sleep(random.uniform(30, 60))
+                await asyncio.sleep(random.uniform(self.settings.CAPTCHA_DELAY_MIN, self.settings.CAPTCHA_DELAY_MAX))
                 raise CollectorError(
                     f"Captcha detected on search page {url}"
                 )
@@ -281,7 +281,7 @@ class AvitoCollector:
 
             # Ожидание загрузки карточки объявления
             selector_found = await self._wait_for_selectors(
-                page, self._AD_SELECTORS, timeout=15000,
+                page, self._AD_SELECTORS, timeout=self.settings.SELECTOR_WAIT_TIMEOUT_MS,
             )
             if not selector_found:
                 self.logger.warning(
@@ -304,12 +304,12 @@ class AvitoCollector:
                     url=url,
                     consecutive_captchas=self._consecutive_captchas,
                 )
-                if self._consecutive_captchas >= 3:
+                if self._consecutive_captchas >= self.settings.MAX_CONSECUTIVE_CAPTCHAS:
                     raise CollectorError(
                         "Слишком много последовательных капч (>= 3). "
                         "Остановка цикла сбора."
                     )
-                await asyncio.sleep(random.uniform(30, 60))
+                await asyncio.sleep(random.uniform(self.settings.CAPTCHA_DELAY_MIN, self.settings.CAPTCHA_DELAY_MAX))
                 raise CollectorError(
                     f"Captcha detected on ad page {url}"
                 )
@@ -418,7 +418,7 @@ class AvitoCollector:
 
             # Ожидание загрузки профиля продавца
             selector_found = await self._wait_for_selectors(
-                page, self._SELLER_SELECTORS, timeout=15000,
+                page, self._SELLER_SELECTORS, timeout=self.settings.SELECTOR_WAIT_TIMEOUT_MS,
             )
             if not selector_found:
                 self.logger.warning(
@@ -446,12 +446,12 @@ class AvitoCollector:
                     url=target_url,
                     consecutive_captchas=self._consecutive_captchas,
                 )
-                if self._consecutive_captchas >= 3:
+                if self._consecutive_captchas >= self.settings.MAX_CONSECUTIVE_CAPTCHAS:
                     raise CollectorError(
                         "Слишком много последовательных капч (>= 3). "
                         "Остановка цикла сбора."
                     )
-                await asyncio.sleep(random.uniform(30, 60))
+                await asyncio.sleep(random.uniform(self.settings.CAPTCHA_DELAY_MIN, self.settings.CAPTCHA_DELAY_MAX))
                 raise CollectorError(
                     f"Captcha detected on seller page {target_url}"
                 )

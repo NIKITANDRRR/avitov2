@@ -151,7 +151,12 @@ def list_searches() -> None:
 # ------------------------------------------------------------------
 
 @app.command("start")
-def start() -> None:
+def start(
+    constant: bool = typer.Option(
+        False, "--constant", "-c",
+        help="Режим 24/7 постоянной работы",
+    ),
+) -> None:
     """Полный запуск: init-db + seed (модельные + категорийные) + scheduler."""
     # 1. Создать таблицы
     _ensure_tables()
@@ -166,8 +171,12 @@ def start() -> None:
     typer.echo("✅ Категорийные поисковые запросы добавлены")
 
     # 4. Запустить scheduler
-    typer.echo(">> Запуск планировщика...")
-    asyncio.run(_run_scheduler())
+    if constant:
+        typer.echo(">> Запуск постоянного режима мониторинга (24/7)...")
+        asyncio.run(_run_constant_scheduler())
+    else:
+        typer.echo(">> Запуск планировщика...")
+        asyncio.run(_run_scheduler())
 
 
 @app.command("run")
@@ -267,6 +276,31 @@ async def _run_scheduler() -> None:
 
     scheduler = Scheduler(settings)
     await scheduler.run()
+
+
+async def _run_constant_scheduler() -> None:
+    """Асинхронная реализация постоянного 24/7 планировщика."""
+    from app.scheduler.scheduler import ConstantScheduler
+    from app.utils import setup_logging
+    from app.config import get_settings
+
+    settings = get_settings()
+    settings.CONSTANT_MODE_ENABLED = True
+    setup_logging(settings.LOG_LEVEL)
+
+    typer.echo(f"    Интервал цикла: {settings.CONSTANT_CYCLE_INTERVAL_SECONDS} сек")
+    typer.echo(f"    Force-pending после поиска: {settings.CONSTANT_FORCE_PENDING_AFTER_SEARCH}")
+    typer.echo(f"    Браузер: {'headless' if settings.CONSTANT_BROWSER_HEADLESS else 'видимый'}")
+    typer.echo("    Нажмите Ctrl+C для остановки.")
+
+    logger = structlog.get_logger("cli")
+    logger.info("starting_constant_scheduler")
+
+    scheduler = ConstantScheduler(settings)
+    try:
+        await scheduler.run()
+    except KeyboardInterrupt:
+        typer.echo("\n[OK] Постоянный режим остановлен.")
 
 
 async def _run_once(force: bool = True) -> None:
@@ -421,7 +455,8 @@ async def _test_telegram() -> None:
     notifier = TelegramNotifier()
     result = await notifier.test_connection()
     if result:
-        typer.echo("OK: Telegram notifier ready (output -> data/notifications.jsonl)")
+        from app.config import get_settings
+        typer.echo(f"OK: Telegram notifier ready (output -> {get_settings().NOTIFICATIONS_LOG_PATH})")
     else:
         typer.echo("FAIL: Telegram notifier check failed.")
         raise typer.Exit(code=1)
@@ -447,11 +482,12 @@ def _seed_searches() -> None:
     import json
     from pathlib import Path
 
+    from app.config import get_settings
     from app.storage import get_session
     from app.storage.repository import Repository
     from app.utils.helpers import build_avito_url
 
-    config_path = Path(__file__).parent.parent.parent / "config" / "products.json"
+    config_path = Path(get_settings().PRODUCTS_CONFIG_PATH)
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
@@ -498,10 +534,11 @@ def _seed_category_searches() -> None:
     import json
     from pathlib import Path
 
+    from app.config import get_settings
     from app.storage import get_session
     from app.storage.repository import Repository
 
-    config_path = Path(__file__).parent.parent.parent / "config" / "categories.json"
+    config_path = Path(get_settings().CATEGORIES_CONFIG_PATH)
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 

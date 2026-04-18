@@ -44,10 +44,9 @@ def print_header(title: str):
 
 
 def main():
-    database_url = os.environ.get(
-        "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/avito",
-    )
+    from app.config.settings import get_settings
+    settings = get_settings()
+    database_url = settings.DATABASE_URL
     engine = create_engine(database_url)
 
     with engine.connect() as conn:
@@ -66,6 +65,8 @@ def main():
             "notifications_sent",
             "segment_stats",
             "segment_price_history",
+            "products",
+            "product_price_snapshots",
         ]
 
         # Белый список допустимых имён таблиц для защиты от SQL-инъекции
@@ -675,6 +676,268 @@ def main():
         print("\n  По бренду (топ-15):")
         for r in rows:
             print(f"    {r['br']:30} : {fmt_num(r['cnt'])}")
+
+        # ============================================================
+        # 17. PRODUCT СТАТИСТИКА
+        # ============================================================
+        print_header("17. PRODUCT СТАТИСТИКА (products)")
+
+        try:
+            result = conn.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE median_price IS NOT NULL) as with_median,
+                    COUNT(*) FILTER (WHERE median_price IS NULL) as without_median,
+                    AVG(listing_count) as avg_listings,
+                    AVG(median_price) FILTER (WHERE median_price IS NOT NULL) as avg_median,
+                    MIN(first_seen_at) as first_seen,
+                    MAX(last_seen_at) as last_seen
+                FROM products
+            """))
+            row = result.mappings().one()
+            print(f"  Всего продуктов               : {fmt_num(row['total'])}")
+            print(f"  С медианой (готовые)         : {fmt_num(row['with_median'])}")
+            print(f"  Без медианы (сырьё)          : {fmt_num(row['without_median'])}")
+            print(f"  Среднее кол-во объявлений    : {fmt_num(row['avg_listings'])}")
+            print(f"  Средняя медианная цена       : {fmt_price(row['avg_median'])}")
+            print(f"  Первый обнаружен             : {str(row['first_seen'])[:19] if row['first_seen'] else 'N/A'}")
+            print(f"  Последний обнаружен          : {str(row['last_seen'])[:19] if row['last_seen'] else 'N/A'}")
+        except Exception as e:
+            print(f"  ОШИБКА - {e}")
+
+        # ============================================================
+        # 18. SNAPSHOT СТАТИСТИКА (product_price_snapshots)
+        # ============================================================
+        print_header("18. SNAPSHOT СТАТИСТИКА (product_price_snapshots)")
+
+        try:
+            result = conn.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(DISTINCT product_id) as products_covered,
+                    MIN(snapshot_at) as first_snapshot,
+                    MAX(snapshot_at) as last_snapshot
+                FROM product_price_snapshots
+            """))
+            row = result.mappings().one()
+            print(f"  Всего снапшотов              : {fmt_num(row['total'])}")
+            print(f"  Покрыто продуктов            : {fmt_num(row['products_covered'])}")
+            print(f"  Первый снапшот               : {str(row['first_snapshot'])[:19] if row['first_snapshot'] else 'N/A'}")
+            print(f"  Последний снапшот            : {str(row['last_snapshot'])[:19] if row['last_snapshot'] else 'N/A'}")
+
+            # Снапшоты за последние 24 часа
+            result = conn.execute(text("""
+                SELECT COUNT(*) as cnt
+                FROM product_price_snapshots
+                WHERE snapshot_at >= NOW() - INTERVAL '24 hours'
+            """))
+            row24 = result.mappings().one()
+            print(f"  Снапшотов за 24ч             : {fmt_num(row24['cnt'])}")
+
+            # Снапшоты за последние 7 дней
+            result = conn.execute(text("""
+                SELECT COUNT(*) as cnt
+                FROM product_price_snapshots
+                WHERE snapshot_at >= NOW() - INTERVAL '7 days'
+            """))
+            row7d = result.mappings().one()
+            print(f"  Снапшотов за 7 дней          : {fmt_num(row7d['cnt'])}")
+        except Exception as e:
+            print(f"  ОШИБКА - {e}")
+
+        # ============================================================
+        # 19. ТОП ПРОДУКТОВ
+        # ============================================================
+        print_header("19. ТОП ПРОДУКТОВ (по кол-ву объявлений)")
+
+        try:
+            result = conn.execute(text("""
+                SELECT
+                    p.normalized_key,
+                    p.brand,
+                    p.model,
+                    p.category,
+                    p.listing_count,
+                    p.median_price,
+                    p.min_price,
+                    p.max_price,
+                    (SELECT COUNT(*) FROM product_price_snapshots ps
+                     WHERE ps.product_id = p.id) as snapshot_count
+                FROM products p
+                ORDER BY p.listing_count DESC
+                LIMIT 25
+            """))
+            rows = result.mappings().all()
+            if rows:
+                print(f"  {'Ключ':45} | {'Бренд':12} | {'Объявл.':>7} | {'Снапш.':>7} | {'Мин':>10} | {'Медиана':>10} | {'Макс':>10}")
+                print(f"  {'-'*45}-+-{'-'*12}-+-{'-'*7}-+-{'-'*7}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
+                for r in rows:
+                    key = (r['normalized_key'] or '')[:45]
+                    brand = (r['brand'] or '')[:12]
+                    lc = r['listing_count'] or 0
+                    sc = r['snapshot_count'] or 0
+                    mn = fmt_price(r['min_price']) if r['min_price'] else "N/A"
+                    med = fmt_price(r['median_price']) if r['median_price'] else "N/A"
+                    mx = fmt_price(r['max_price']) if r['max_price'] else "N/A"
+                    print(f"  {key:45} | {brand:12} | {lc:>7} | {sc:>7} | {mn:>10} | {med:>10} | {mx:>10}")
+            else:
+                print("  Нет данных о продуктах")
+        except Exception as e:
+            print(f"  ОШИБКА - {e}")
+
+        # ============================================================
+        # 20. ГОТОВНОСТЬ К ДЕТЕКЦИИ «БРИЛЛИАНТОВ»
+        # ============================================================
+        print_header("20. ГОТОВНОСТЬ К ДЕТЕКЦИИ «БРИЛЛИАНТОВ»")
+
+        try:
+            result = conn.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE listing_count >= 3) as with_3plus_listings,
+                    COUNT(*) FILTER (WHERE listing_count >= 5) as with_5plus_listings,
+                    COUNT(*) FILTER (WHERE median_price IS NOT NULL) as with_median,
+                    COUNT(*) FILTER (WHERE listing_count >= 3 AND median_price IS NOT NULL) as ready_for_diamonds
+                FROM products
+            """))
+            row = result.mappings().one()
+            print(f"  Всего продуктов               : {fmt_num(row['total'])}")
+            print(f"  С >=3 объявлений             : {fmt_num(row['with_3plus_listings'])}")
+            print(f"  С >=5 объявлений             : {fmt_num(row['with_5plus_listings'])}")
+            print(f"  С медианой                   : {fmt_num(row['with_median'])}")
+            print(f"  ГОТОВЫ к детекции            : {fmt_num(row['ready_for_diamonds'])}")
+
+            if row['ready_for_diamonds'] == 0:
+                print("\n  ⚠️  НЕТ продуктов, готовых к детекции «бриллиантов»!")
+                print("     Возможные причины:")
+                print("     1. Мало данных — нужно больше циклов сбора")
+                print("     2. Нормализация слишком дробит товары")
+                print("     3. Pipeline не пишет product_price_snapshots")
+            else:
+                print(f"\n  ✅ {fmt_num(row['ready_for_diamonds'])} продуктов готовы к детекции")
+
+            # Дополнительно: продукты с наибольшим числом снапшотов
+            result = conn.execute(text("""
+                SELECT
+                    p.normalized_key,
+                    COUNT(ps.id) as snap_count,
+                    p.median_price
+                FROM products p
+                JOIN product_price_snapshots ps ON ps.product_id = p.id
+                GROUP BY p.id, p.normalized_key, p.median_price
+                ORDER BY snap_count DESC
+                LIMIT 10
+            """))
+            rows = result.mappings().all()
+            if rows:
+                print(f"\n  Продукты с наибольшим числом снапшотов:")
+                print(f"  {'Ключ':50} | {'Снапшоты':>10} | {'Медиана':>12}")
+                print(f"  {'-'*50}-+-{'-'*10}-+-{'-'*12}")
+                for r in rows:
+                    key = (r['normalized_key'] or '')[:50]
+                    med = fmt_price(r['median_price']) if r['median_price'] else "N/A"
+                    print(f"  {key:50} | {fmt_num(r['snap_count']):>10} | {med:>12}")
+        except Exception as e:
+            print(f"  ОШИБКА - {e}")
+
+        # ============================================================
+        # 21. КАЧЕСТВО НОРМАЛИЗАЦИИ
+        # ============================================================
+        print_header("21. КАЧЕСТВО НОРМАЛИЗАЦИИ")
+
+        try:
+            # Распределение по длине ключа
+            result = conn.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    AVG(LENGTH(normalized_key)) as avg_key_len,
+                    MAX(LENGTH(normalized_key)) as max_key_len,
+                    MIN(LENGTH(normalized_key)) as min_key_len,
+                    COUNT(*) FILTER (WHERE LENGTH(normalized_key) > 80) as long_keys,
+                    COUNT(*) FILTER (WHERE LENGTH(normalized_key) <= 20) as short_keys,
+                    COUNT(DISTINCT brand) as unique_brands,
+                    COUNT(DISTINCT category) as unique_categories
+                FROM products
+            """))
+            row = result.mappings().one()
+            print(f"  Всего уникальных ключей      : {fmt_num(row['total'])}")
+            print(f"  Средняя длина ключа          : {fmt_num(row['avg_key_len'])} символов")
+            print(f"  Мин. длина ключа             : {fmt_num(row['min_key_len'])}")
+            print(f"  Макс. длина ключа            : {fmt_num(row['max_key_len'])}")
+            print(f"  Длинных ключей (>80 симв.)   : {fmt_num(row['long_keys'])}")
+            print(f"  Коротких ключей (<=20 симв.) : {fmt_num(row['short_keys'])}")
+            print(f"  Уникальных брендов           : {fmt_num(row['unique_brands'])}")
+            print(f"  Уникальных категорий         : {fmt_num(row['unique_categories'])}")
+
+            # Топ брендов
+            result = conn.execute(text("""
+                SELECT COALESCE(brand, '(нет бренда)') as br, COUNT(*) as cnt
+                FROM products
+                GROUP BY brand
+                ORDER BY cnt DESC
+                LIMIT 15
+            """))
+            rows = result.mappings().all()
+            if rows:
+                print(f"\n  Топ брендов по продуктам:")
+                for r in rows:
+                    print(f"    {r['br']:30} : {fmt_num(r['cnt'])}")
+
+            # Подозрительные ключи (слишком длинные или мусорные)
+            result = conn.execute(text("""
+                SELECT normalized_key, listing_count
+                FROM products
+                WHERE LENGTH(normalized_key) > 80
+                   OR normalized_key LIKE '%разное%'
+                   OR normalized_key LIKE '%прочее%'
+                   OR listing_count = 1
+                ORDER BY listing_count ASC
+                LIMIT 20
+            """))
+            rows = result.mappings().all()
+            if rows:
+                print(f"\n  Подозрительные ключи (длинные/мусор/одиночки):")
+                print(f"  {'Ключ':65} | {'Объявл.':>7}")
+                print(f"  {'-'*65}-+-{'-'*7}")
+                for r in rows:
+                    key = (r['normalized_key'] or '')[:65]
+                    print(f"  {key:65} | {r['listing_count']:>7}")
+            else:
+                print("\n  ✅ Подозрительных ключей не обнаружено")
+        except Exception as e:
+            print(f"  ОШИБКА - {e}")
+
+        # ============================================================
+        # 22. СВЯЗЬ ADS ↔ PRODUCTS (coverage)
+        # ============================================================
+        print_header("22. СВЯЗЬ ADS ↔ PRODUCTS (coverage)")
+
+        try:
+            # Сколько объявлений привязаны к продуктам через snapshots
+            result = conn.execute(text("""
+                SELECT
+                    (SELECT COUNT(*) FROM ads) as total_ads,
+                    (SELECT COUNT(*) FROM product_price_snapshots) as total_snapshots,
+                    (SELECT COUNT(DISTINCT ad_id) FROM product_price_snapshots
+                     WHERE ad_id IS NOT NULL) as ads_with_snapshots,
+                    (SELECT COUNT(*) FROM products) as total_products
+            """))
+            row = result.mappings().one()
+            total_ads = row['total_ads'] or 0
+            ads_with_snaps = row['ads_with_snapshots'] or 0
+            coverage_pct = (ads_with_snaps / total_ads * 100) if total_ads > 0 else 0
+            print(f"  Всего объявлений             : {fmt_num(total_ads)}")
+            print(f"  Всего снапшотов              : {fmt_num(row['total_snapshots'])}")
+            print(f"  Объявлений со снапшотами     : {fmt_num(ads_with_snaps)} ({coverage_pct:.1f}%)")
+            print(f"  Всего продуктов              : {fmt_num(row['total_products'])}")
+
+            if coverage_pct < 10 and total_ads > 50:
+                print("\n  ⚠️  НИЗКИЙ COVERAGE! Менее 10% объявлений имеют product-снапшоты.")
+                print("     Pipeline может не создавать snapshots корректно.")
+            elif coverage_pct > 50:
+                print(f"\n  ✅ Coverage хороший: {coverage_pct:.1f}%")
+        except Exception as e:
+            print(f"  ОШИБКА - {e}")
 
         print()
         print_separator()

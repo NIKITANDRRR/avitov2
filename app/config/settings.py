@@ -7,17 +7,18 @@ from typing import Any, ClassVar, Tuple, Type
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
-from pydantic_settings.sources import DotEnvSettingsSource
+from pydantic_settings.sources import DotEnvSettingsSource, EnvSettingsSource
+
+
+# Поля, которые передаются как comma-separated строки, а не JSON
+_COMMA_LIST_FIELDS: set[str] = {"SEARCH_URLS", "EMAIL_TO", "USER_AGENTS"}
 
 
 class _CommaListDotEnvSource(DotEnvSettingsSource):
-    """Кастомный DotEnv-источник, который для поля SEARCH_URLS
+    """Кастомный DotEnv-источник, который для comma-list полей
     не пытается декодировать значение как JSON, а передаёт
     сырую строку дальше — field_validator разберёт её по запятым.
     """
-
-    # Имя поля, которое нужно обрабатывать особым образом
-    _COMMA_LIST_FIELDS: ClassVar[set[str]] = {"SEARCH_URLS", "EMAIL_TO"}
 
     def decode_complex_value(
         self,
@@ -25,9 +26,26 @@ class _CommaListDotEnvSource(DotEnvSettingsSource):
         field: Any,
         value: Any,
     ) -> Any:
-        if field_name in self._COMMA_LIST_FIELDS and isinstance(value, str):
-            # Не пытаемся json.loads — возвращаем как есть,
-            # field_validator потом разобьёт по запятым.
+        if field_name in _COMMA_LIST_FIELDS and isinstance(value, str):
+            return value
+        return super().decode_complex_value(field_name, field, value)
+
+
+class _CommaListEnvSource(EnvSettingsSource):
+    """Кастомный Env-источник (os.environ), который для comma-list полей
+    не пытается декодировать значение как JSON.
+
+    Это нужно, когда .env загружается через python-dotenv (load_dotenv),
+    и значения попадают в os.environ как обычные строки.
+    """
+
+    def decode_complex_value(
+        self,
+        field_name: str,
+        field: Any,
+        value: Any,
+    ) -> Any:
+        if field_name in _COMMA_LIST_FIELDS and isinstance(value, str):
             return value
         return super().decode_complex_value(field_name, field, value)
 
@@ -160,6 +178,26 @@ class Settings(BaseSettings):
         description="Порог % от медианы для недооценённости",
     )
 
+    # === Настройки детекции бриллиантов ===
+    DIAMOND_DISCOUNT_THRESHOLD: float = Field(
+        default=0.85,
+        gt=0.5,
+        le=1.0,
+        description="Порог price/median для детекции бриллиантов (0.85 = 15% ниже медианы)",
+    )
+    DIAMOND_MIN_SNAPSHOTS: int = Field(
+        default=3,
+        ge=2,
+        le=20,
+        description="Минимум снапшотов продукта для использования product-level медианы",
+    )
+    DIAMOND_FAST_SALE_THRESHOLD: float = Field(
+        default=0.8,
+        gt=0.5,
+        le=1.0,
+        description="Порог для медианы быстрых продаж (segment fallback)",
+    )
+
     # === Фильтрация аксессуаров ===
     ENABLE_ACCESSORY_FILTER: bool = Field(
         default=True,
@@ -174,7 +212,7 @@ class Settings(BaseSettings):
             "чехол", "case", "кейс", "сумка",
             "шлейф", "кабель", "провод",
             "матрица", "экран", "дисплей",
-            "блок питания", "зарядк", "адаптер", "power adapter",
+            "блок питания", "зарядк", "адаптер питания", "power adapter",
             "клавиатура", "keyboard",
             "игр", "game",
             "стилус", "pen", "pencil",
@@ -404,6 +442,131 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = Field(default="INFO")
 
+    # === Avito base URL ===
+    AVITO_BASE_URL: str = Field(
+        default="https://www.avito.ru",
+        description="Базовый URL сайта Avito",
+    )
+
+    # === Database connection pool ===
+    DB_POOL_SIZE: int = Field(
+        default=5, ge=1, le=50,
+        description="Размер пула подключений к БД",
+    )
+    DB_MAX_OVERFLOW: int = Field(
+        default=10, ge=0, le=50,
+        description="Макс. дополнительных подключений сверх pool_size",
+    )
+    DB_POOL_RECYCLE: int = Field(
+        default=1800, ge=60,
+        description="Время жизни подключения в пуле (сек)",
+    )
+    DB_CONNECT_TIMEOUT: int = Field(
+        default=10, ge=1, le=60,
+        description="Таймаут подключения к БД (сек)",
+    )
+
+    # === Telegram session path ===
+    TELEGRAM_SESSION_PATH: str = Field(
+        default="data/bot_session",
+        description="Путь к файлу сессии Telethon (без расширения)",
+    )
+
+    # === Browser fingerprint settings ===
+    BROWSER_LOCALE: str = Field(
+        default="ru-RU",
+        description="Локаль браузера",
+    )
+    BROWSER_TIMEZONE: str = Field(
+        default="Europe/Moscow",
+        description="Часовой пояс браузера",
+    )
+    USER_AGENTS: list[str] = Field(
+        default=[
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+        ],
+        description="Список User-Agent строк для ротации (JSON или comma-separated)",
+    )
+    BROWSER_VIEWPORTS: list[dict[str, int]] = Field(
+        default=[
+            {"width": 1920, "height": 1080},
+            {"width": 1536, "height": 864},
+            {"width": 1440, "height": 900},
+        ],
+        description="Список viewport размеров для ротации (JSON)",
+    )
+
+    # === Page timeouts ===
+    PAGE_NAVIGATION_TIMEOUT_MS: int = Field(
+        default=30000, ge=5000, le=120000,
+        description="Таймаут навигации страницы (мс)",
+    )
+    SELECTOR_WAIT_TIMEOUT_MS: int = Field(
+        default=15000, ge=1000, le=60000,
+        description="Таймаут ожидания селекторов (мс)",
+    )
+
+    # === Captcha settings ===
+    MAX_CONSECUTIVE_CAPTCHAS: int = Field(
+        default=3, ge=1, le=10,
+        description="Порог последовательных капч для паузы",
+    )
+    CAPTCHA_DELAY_MIN: float = Field(
+        default=30.0, ge=5.0,
+        description="Мин. задержка при обнаружении капчи (сек)",
+    )
+    CAPTCHA_DELAY_MAX: float = Field(
+        default=60.0, ge=10.0,
+        description="Макс. задержка при обнаружении капчи (сек)",
+    )
+    CAPTCHA_MANUAL_INPUT_WAIT: int = Field(
+        default=120, ge=30, le=600,
+        description="Ожидание ручного ввода капчи (сек)",
+    )
+
+    # === Scheduler ===
+    SCHEDULER_CYCLE_INTERVAL_SECONDS: int = Field(
+        default=300, ge=60, le=3600,
+        description="Интервал цикла планировщика (сек)",
+    )
+
+    # --- Constant mode settings ---
+    CONSTANT_MODE_ENABLED: bool = Field(
+        default=False,
+        description="Включить режим 24/7 постоянной работы",
+    )
+    CONSTANT_CYCLE_INTERVAL_SECONDS: int = Field(
+        default=300, ge=60, le=3600,
+        description="Интервал между полными циклами в constant режиме (секунд)",
+    )
+    CONSTANT_FORCE_PENDING_AFTER_SEARCH: bool = Field(
+        default=True,
+        description="Запускать force-pending после каждого цикла поиска",
+    )
+    CONSTANT_BROWSER_HEADLESS: bool = Field(
+        default=False,
+        description="Headless режим браузера в constant режиме",
+    )
+
+    # === Config file paths ===
+    PRODUCTS_CONFIG_PATH: str = Field(
+        default="config/products.json",
+        description="Путь к файлу конфигурации продуктов",
+    )
+    CATEGORIES_CONFIG_PATH: str = Field(
+        default="config/categories.json",
+        description="Путь к файлу конфигурации категорий",
+    )
+    NOTIFICATIONS_LOG_PATH: str = Field(
+        default="data/notifications.jsonl",
+        description="Путь к файлу лога уведомлений",
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @classmethod
@@ -415,13 +578,13 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> Tuple[PydanticBaseSettingsSource, ...]:
-        """Заменяет стандартный DotEnvSettingsSource на кастомный."""
-        # Подменяем dotenv-источник на наш, который не JSON-декодирует
-        # comma-separated поля.
+        """Заменяет стандартные EnvSettingsSource и DotEnvSettingsSource
+        на кастомные, которые не JSON-декодируют comma-separated поля."""
+        custom_env = _CommaListEnvSource(settings_cls)
         custom_dotenv = _CommaListDotEnvSource(settings_cls)
         return (
             init_settings,
-            env_settings,
+            custom_env,
             custom_dotenv,
             file_secret_settings,
         )
@@ -448,6 +611,14 @@ class Settings(BaseSettings):
         """Разбивает строку с email-адресами, разделёнными запятыми, в список."""
         if isinstance(v, str):
             return [email.strip() for email in v.split(",") if email.strip()]
+        return v
+
+    @field_validator("USER_AGENTS", mode="before")
+    @classmethod
+    def _split_user_agents(cls, v: str | list[str]) -> list[str]:
+        """Разбивает строку с User-Agent'ами, разделёнными запятыми, в список."""
+        if isinstance(v, str):
+            return [ua.strip() for ua in v.split(",") if ua.strip()]
         return v
 
 

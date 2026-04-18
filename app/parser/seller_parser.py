@@ -11,7 +11,7 @@ import structlog
 from bs4 import BeautifulSoup, Tag
 
 from app.utils.exceptions import ParserError
-from app.utils.helpers import normalize_price
+from app.utils.helpers import get_avito_base_url, normalize_price
 
 log = structlog.get_logger()
 
@@ -299,7 +299,7 @@ def _parse_single_sold_item(element: Tag) -> SoldItemData | None:
         if href:
             item_url = str(href)
             if item_url.startswith("/"):
-                item_url = "https://www.avito.ru" + item_url
+                item_url = get_avito_base_url() + item_url
 
     # Fallback: извлечь категорию из URL товара
     # Формат Avito: /ГОРОД/КАТЕГОРИЯ/ПОДКАТЕГОРИЯ/название_ID

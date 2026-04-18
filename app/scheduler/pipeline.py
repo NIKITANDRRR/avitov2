@@ -24,6 +24,7 @@ from app.analysis import PriceAnalyzer, UndervaluedAd, AdAnalysisResult, MarketS
 from app.analysis.accessory_filter import AccessoryFilter
 from app.analysis.segment_analyzer import SegmentAnalyzer, DiamondAlert, CategorySegmentKey
 from app.analysis.attribute_extractor import AttributeExtractor
+from app.analysis.product_normalizer import normalize_title
 from app.notifier import EmailNotifier, TelegramNotifier
 from app.utils import random_delay, setup_logging, extract_ad_id_from_url, normalize_url, build_page_url
 from app.utils.helpers import RateLimiter
@@ -431,6 +432,75 @@ class Pipeline:
         )
         return self.stats
 
+    async def run_constant_cycle(self) -> dict[str, int]:
+        """Один цикл constant режима: search → force-pending.
+
+        Алгоритм:
+            1. Сбросить статистику.
+            2. Вызвать ``run_search_cycle()`` — сбор новых объявлений.
+            3. Если ``CONSTANT_FORCE_PENDING_AFTER_SEARCH=True`` и есть
+               pending объявления — вызвать ``run_force_pending_cycle()``.
+            4. Вернуть объединённую статистику.
+
+        Returns:
+            dict[str, int]: Объединённая статистика цикла.
+        """
+        self.logger.info("constant_cycle_start")
+
+        # 1. Сброс статистики
+        self.stats = {k: 0 for k in self.stats}
+
+        # 2. Сбор новых объявлений
+        search_stats = await self.run_search_cycle()
+        self.logger.info(
+            "constant_cycle_search_done",
+            searches_processed=search_stats.get("searches_processed", 0),
+            ads_found=search_stats.get("ads_found", 0),
+            ads_new=search_stats.get("ads_new", 0),
+            errors=search_stats.get("errors", 0),
+        )
+
+        # 3. Дообработка pending (если включена)
+        pending_stats: dict[str, int] = {}
+        if self.settings.CONSTANT_FORCE_PENDING_AFTER_SEARCH:
+            try:
+                session = get_session()
+                repo = Repository(session)
+                try:
+                    pending_ads = repo.get_pending_ads()
+                finally:
+                    repo.close()
+
+                if pending_ads:
+                    self.logger.info(
+                        "constant_cycle_pending_found",
+                        pending_count=len(pending_ads),
+                    )
+                    pending_stats = await self.run_force_pending_cycle()
+                    self.logger.info(
+                        "constant_cycle_pending_done",
+                        pending_processed=pending_stats.get("pending_processed", 0),
+                        pending_success=pending_stats.get("pending_success", 0),
+                        pending_failed=pending_stats.get("pending_failed", 0),
+                    )
+                else:
+                    self.logger.info("constant_cycle_no_pending")
+            except Exception as exc:
+                self.logger.error(
+                    "constant_cycle_pending_error",
+                    error=str(exc),
+                    exc_info=True,
+                )
+
+        # 4. Объединённая статистика
+        combined = {**search_stats}
+        combined.update({
+            f"pending_{k}": v for k, v in pending_stats.items()
+        })
+
+        self.logger.info("constant_cycle_complete", **combined)
+        return combined
+
     async def run_force_parse_cycle(self) -> dict:
         """Принудительный запуск парсинга: сначала все товары, затем категории по очереди.
 
@@ -632,8 +702,8 @@ class Pipeline:
                                 attempt=attempt,
                                 msg="waiting for manual input (120s)...",
                             )
-                            # Ждём 120 секунд — пользователь вводит капчу
-                            await asyncio.sleep(120)
+                            # Ждём CAPTCHA_MANUAL_INPUT_WAIT секунд — пользователь вводит капчу
+                            await asyncio.sleep(self.settings.CAPTCHA_MANUAL_INPUT_WAIT)
 
                             # Повторная загрузка страницы после ввода капчи
                             html, html_path = await collector.collect_ad_page(ad.url)
@@ -1127,6 +1197,60 @@ class Pipeline:
 
             run_errors += run_errors_counter[0]
 
+            # --- Product-нормализация на уровне search (ВСЕ найденные) ---
+            # Это ключевой фикс: раньше Product создавался только при
+            # открытии карточки (parse_ad_page), что давало ~3-5% coverage.
+            # Теперь нормализуем и записываем snapshot для КАЖДОГО
+            # объявления из поисковой выдачи с title и price.
+            product_snapshot_count = 0
+            product_ids_to_update: set[int] = set()
+            for item in all_search_items:
+                if not item.title or not item.price or item.price <= 0:
+                    continue
+                try:
+                    norm = normalize_title(item.title)
+                    product = repo.get_or_create_product(
+                        normalized_key=norm.normalized_key,
+                        brand=norm.brand,
+                        model=norm.model,
+                        category=getattr(tracked_search, "category", None),
+                    )
+                    # Привязываем snapshot к объявлению через ad_id
+                    _ad_record = repo.get_ad_by_ad_id(item.ad_id)
+                    _ad_internal_id = _ad_record.id if _ad_record else None
+                    repo.add_product_price_snapshot(
+                        product_id=product.id,
+                        price=item.price,
+                        ad_id=_ad_internal_id,
+                    )
+                    product_ids_to_update.add(product.id)
+                    product_snapshot_count += 1
+                except Exception as product_exc:
+                    self.logger.debug(
+                        "search_level_product_normalization_failed",
+                        title=item.title[:60],
+                        error=str(product_exc),
+                    )
+
+            # Батчевое обновление статистики продуктов (не в hot-path)
+            for pid in product_ids_to_update:
+                try:
+                    repo.update_product_stats(pid)
+                except Exception as stats_exc:
+                    self.logger.debug(
+                        "product_stats_update_failed",
+                        product_id=pid,
+                        error=str(stats_exc),
+                    )
+
+            if product_snapshot_count > 0:
+                self.logger.info(
+                    "search_level_product_snapshots_created",
+                    search_url=search_url,
+                    snapshots=product_snapshot_count,
+                    products_updated=len(product_ids_to_update),
+                )
+
             # Завершение запуска
             repo.complete_search_run(
                 search_run.id,
@@ -1284,6 +1408,31 @@ class Pipeline:
                 price=ad_data.price,
                 html_path=html_path,
             )
+
+            # --- Нормализация товара и запись в Product ---
+            if ad_data.title and ad_data.price and ad_data.price > 0:
+                try:
+                    norm = normalize_title(ad_data.title)
+                    product = repo.get_or_create_product(
+                        normalized_key=norm.normalized_key,
+                        brand=norm.brand,
+                        model=norm.model,
+                        category=getattr(ad_record, "ad_category", None),
+                    )
+                    repo.add_product_price_snapshot(
+                        product_id=product.id,
+                        price=ad_data.price,
+                        ad_id=ad_record.id,
+                    )
+                    # update_product_stats убран из hot-path:
+                    # теперь вызывается батчем в _process_search
+                except Exception as product_exc:
+                    self.logger.warning(
+                        "product_normalization_failed",
+                        ad_id=ad_id,
+                        title=ad_data.title,
+                        error=str(product_exc),
+                    )
 
             savepoint.commit()
 
@@ -1629,6 +1778,19 @@ class Pipeline:
                             search, repo,
                         )
                         for diamond in diamonds:
+                            # Устанавливаем флаг is_undervalued на модели Ad
+                            try:
+                                repo.update_ad(
+                                    diamond.ad.ad_id,
+                                    is_undervalued=True,
+                                    undervalue_score=-diamond.discount_percent / 100,
+                                )
+                            except Exception as flag_exc:
+                                self.logger.warning(
+                                    "diamond_undervalued_flag_failed",
+                                    ad_id=diamond.ad.ad_id,
+                                    error=str(flag_exc),
+                                )
                             undervalued_item = UndervaluedAd(
                                 ad=diamond.ad,
                                 market_stats=MarketStats(
@@ -1981,143 +2143,135 @@ class Pipeline:
             segments=len(segment_results),
         )
 
-        # 7. Детекция «бриллиантов»
+        # 7. Детекция «бриллиантов» — product-first подход
         diamonds: list[DiamondAlert] = []
-        for segment_key_str, stats_dict in segment_results.items():
-            best_median, reason = segment_analyzer.get_best_median(stats_dict)
-            if best_median <= 0:
+        discount_threshold = self.settings.DIAMOND_DISCOUNT_THRESHOLD
+        min_snapshots = self.settings.DIAMOND_MIN_SNAPSHOTS
+        fast_sale_threshold = self.settings.DIAMOND_FAST_SALE_THRESHOLD
+
+        product_hits = 0
+        segment_hits = 0
+        no_data_count = 0
+
+        for ad in filtered_ads:
+            if ad.price is None or ad.price <= 0:
                 continue
 
-            # Ищем «бриллианты» среди объявлений этого сегмента
-            segment_ads = [
-                ad for ad in filtered_ads
-                if segment_analyzer.build_segment_key(ad).to_string() == segment_key_str
-            ]
-            for ad in segment_ads:
-                if ad.price is None or ad.price <= 0:
-                    continue
-                diamond = self._check_diamond_candidate(
-                    ad, stats_dict, best_median, reason,
-                )
-                if diamond is not None:
-                    diamonds.append(diamond)
+            effective_median: float | None = None
+            effective_reason: str = "none"
+            product_key: str | None = None
+            sample_size = 0
+
+            # --- ПРИОРИТЕТ 1: Product-level медиана ---
+            if ad.title:
+                try:
+                    from app.analysis.product_normalizer import normalize_title
+                    norm = normalize_title(ad.title)
+                    product_key = norm.normalized_key
+                    product = repo.get_product_by_key(product_key)
+                    if product is not None:
+                        stats = repo.get_product_price_stats(product.id)
+                        p_count = stats.get("count", 0)
+                        p_median = stats.get("median")
+                        if p_count >= min_snapshots and p_median is not None and p_median > 0:
+                            effective_median = float(p_median)
+                            effective_reason = (
+                                f"product_median ({p_median:,.0f}₽) "
+                                f"по {p_count} записям, key={product_key}"
+                            )
+                            sample_size = p_count
+                            product_hits += 1
+                except Exception as exc:
+                    self.logger.debug(
+                        "diamond_product_lookup_failed",
+                        ad_id=ad.ad_id,
+                        error=str(exc),
+                    )
+
+            # --- ПРИОРИТЕТ 2: Segment-level fallback ---
+            if effective_median is None:
+                seg_key_str = segment_analyzer.build_segment_key(ad).to_string()
+                seg_stats = segment_results.get(seg_key_str)
+                if seg_stats is not None:
+                    best_median, reason = segment_analyzer.get_best_median(seg_stats)
+                    if best_median > 0:
+                        effective_median = best_median
+                        effective_reason = reason
+                        sample_size = seg_stats.get("sample_size", 0)
+                        segment_hits += 1
+
+            # --- Нет данных — пропускаем ---
+            if effective_median is None or effective_median <= 0:
+                no_data_count += 1
+                continue
+
+            # --- Проверка порога ---
+            ratio = ad.price / effective_median
+
+            self.logger.debug(
+                "diamond_candidate_ratio",
+                ad_id=ad.ad_id,
+                price=ad.price,
+                median=effective_median,
+                ratio=round(ratio, 3),
+                threshold=discount_threshold,
+                source=effective_reason,
+                product_key=product_key,
+            )
+
+            if ratio >= discount_threshold:
+                continue  # Не бриллиант
+
+            # --- Создание DiamondAlert ---
+            discount_percent = (1 - ratio) * 100
+            segment_key = CategorySegmentKey(
+                category=getattr(ad, "ad_category", "unknown") or "unknown",
+                brand=getattr(ad, "brand", "unknown") or "unknown",
+                model=getattr(ad, "extracted_model", "unknown") or "unknown",
+                condition=getattr(ad, "condition", "unknown") or "unknown",
+                location=getattr(ad, "location", "unknown") or "unknown",
+            )
+
+            reason_msg = (
+                f"цена {ad.price:,.0f}₽ < {effective_reason} "
+                f"× {discount_threshold} (ratio={ratio:.2f}, "
+                f"скидка={discount_percent:.1f}%)"
+            )
+
+            self.logger.info(
+                "diamond_detected",
+                ad_id=ad.ad_id,
+                price=ad.price,
+                effective_median=effective_median,
+                ratio=round(ratio, 3),
+                discount_percent=round(discount_percent, 1),
+                product_key=product_key,
+                source=effective_reason,
+            )
+
+            diamonds.append(DiamondAlert(
+                ad=ad,
+                segment_key=segment_key,
+                segment_stats=None,
+                price=ad.price,
+                median_price=effective_median,
+                discount_percent=discount_percent,
+                sample_size=sample_size,
+                reason=reason_msg,
+                is_rare_segment=False,
+            ))
 
         self.logger.info(
             "category_search_diamonds_detected",
             search_id=search.id,
             diamonds_count=len(diamonds),
+            product_hits=product_hits,
+            segment_hits=segment_hits,
+            no_data_count=no_data_count,
+            total_candidates=len(filtered_ads),
         )
 
         return diamonds
-
-    def _check_diamond_candidate(
-        self,
-        ad: "Ad",
-        segment_stats: dict,
-        best_median: float,
-        median_reason: str,
-    ) -> DiamondAlert | None:
-        """Проверяет, является ли объявление «бриллиантом».
-
-        Условия:
-            - Сегмент редкий (``is_rare_segment = True``) **или**
-              цена < ``listing_price_median * 0.7`` (на 30% ниже медианы).
-            - И/или цена < ``fast_sale_price_median * 0.8``.
-            - И/или исторически быстрые продажи были сильно выше текущего
-              листинга.
-
-        Args:
-            ad: Объявление для проверки.
-            segment_stats: Словарь статистики сегмента.
-            best_median: Лучшая медиана сегмента.
-            median_reason: Описание причины выбора медианы.
-
-        Returns:
-            DiamondAlert | None: Алерт если «бриллиант», иначе ``None``.
-        """
-        if ad.price is None or ad.price <= 0 or best_median <= 0:
-            return None
-
-        listing_price_median = segment_stats.get("listing_price_median")
-        fast_sale_price_median = segment_stats.get("fast_sale_price_median")
-        is_rare = segment_stats.get("is_rare_segment", False)
-        sample_size = segment_stats.get("sample_size", 0)
-
-        # Пороговые коэффициенты
-        discount_threshold = 0.7   # 30% ниже медианы
-        fast_sale_threshold = 0.8  # 20% ниже медианы быстрой продажи
-
-        reasons: list[str] = []
-        is_diamond = False
-
-        # Проверка: цена значительно ниже медианы листинга
-        if (
-            listing_price_median is not None
-            and listing_price_median > 0
-            and ad.price < listing_price_median * discount_threshold
-        ):
-            is_diamond = True
-            reasons.append(
-                f"цена {ad.price:,.0f}₽ < listing_median "
-                f"{listing_price_median:,.0f}₽ × {discount_threshold}"
-            )
-
-        # Проверка: цена ниже медианы быстрых продаж
-        if (
-            fast_sale_price_median is not None
-            and fast_sale_price_median > 0
-            and ad.price < fast_sale_price_median * fast_sale_threshold
-        ):
-            is_diamond = True
-            reasons.append(
-                f"цена {ad.price:,.0f}₽ < fast_sale_median "
-                f"{fast_sale_price_median:,.0f}₽ × {fast_sale_threshold}"
-            )
-
-        # Редкий сегмент — дополнительный бонус
-        if is_rare and ad.price < best_median * 0.85:
-            is_diamond = True
-            reasons.append(
-                f"редкий сегмент + цена {ad.price:,.0f}₽ < "
-                f"best_median {best_median:,.0f}₽ × 0.85"
-            )
-
-        if not is_diamond:
-            return None
-
-        discount_percent = (
-            (best_median - ad.price) / best_median * 100
-        )
-
-        # Сегментный ключ
-        segment_key = CategorySegmentKey(
-            category=getattr(ad, "ad_category", "unknown") or "unknown",
-            brand=getattr(ad, "brand", "unknown") or "unknown",
-            model=getattr(ad, "extracted_model", "unknown") or "unknown",
-            condition=getattr(ad, "condition", "unknown") or "unknown",
-            location=getattr(ad, "location", "unknown") or "unknown",
-        )
-
-        self.logger.info(
-            "diamond_detected",
-            ad_id=ad.ad_id,
-            price=ad.price,
-            best_median=best_median,
-            discount_percent=round(discount_percent, 1),
-            reason="; ".join(reasons),
-        )
-
-        return DiamondAlert(
-            ad=ad,
-            segment_key=segment_key,
-            segment_stats=None,
-            price=ad.price,
-            median_price=best_median,
-            discount_percent=discount_percent,
-            sample_size=sample_size,
-            reason="; ".join(reasons),
-            is_rare_segment=is_rare,
-        )
 
     def _early_filter_search_items(
         self,

@@ -1073,7 +1073,7 @@ class SegmentAnalyzer:
         if segment_stats_map is None:
             segment_stats_map = {}
 
-        discount_threshold = self._get_setting("CATEGORY_DISCOUNT_THRESHOLD", 0.7)
+        discount_threshold = self._get_setting("DIAMOND_DISCOUNT_THRESHOLD", 0.85)
         rare_threshold = self._get_setting(
             "CATEGORY_RARE_SEGMENT_THRESHOLD",
             self._get_setting("segment_rare_threshold", 5),
@@ -1202,7 +1202,7 @@ class SegmentAnalyzer:
 
         Использует исторические медианы и составной score.
         """
-        discount_threshold = self._get_setting("CATEGORY_DISCOUNT_THRESHOLD", 0.7)
+        discount_threshold = self._get_setting("DIAMOND_DISCOUNT_THRESHOLD", 0.85)
 
         # Выбираем референсную цену
         reference_price: float | None = None

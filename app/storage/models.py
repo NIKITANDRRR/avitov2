@@ -535,6 +535,7 @@ class SegmentStats(Base):
     # Объём
     sample_size: Mapped[int] = mapped_column(Integer, default=0)
     listing_count: Mapped[int] = mapped_column(Integer, default=0)
+    ad_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # Оборачиваемость
     appearance_count_90d: Mapped[int] = mapped_column(Integer, default=0)
@@ -644,4 +645,125 @@ class SegmentPriceHistory(Base):
             f"<SegmentPriceHistory id={self.id} "
             f"segment_stats_id={self.segment_stats_id} "
             f"date={self.snapshot_date}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Product — нормализованный товар (группа однородных объявлений)
+# ---------------------------------------------------------------------------
+
+class Product(Base):
+    """Нормализованный товар — кластер однородных объявлений.
+
+    Группирует объявления по ``normalized_key`` (brand + model + ёмкость/
+    размер и т.п.), чтобы строить историю цен и стабильный baseline
+    для детекции «бриллиантов».
+
+    Attributes:
+        id: Первичный ключ.
+        normalized_key: Уникальный нормализованный ключ товара
+            (например ``iphone_13_128``).
+        brand: Бренд товара (Apple, Samsung, …).
+        model: Модель товара (iPhone 13, Galaxy S21, …).
+        category: Категория (телефоны, телевизоры, …).
+        first_seen_at: Дата-время первого обнаружения.
+        last_seen_at: Дата-время последнего обнаружения.
+        listing_count: Количество связанных объявлений.
+        median_price: Текущая медианная цена по истории.
+        min_price: Минимальная цена за всё время.
+        max_price: Максимальная цена за всё время.
+        created_at: Дата-время создания записи.
+        updated_at: Дата-время последнего обновления записи.
+    """
+
+    __tablename__ = "products"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    normalized_key: Mapped[str] = mapped_column(
+        String(512), unique=True, nullable=False, index=True,
+    )
+    brand: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    first_seen_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    last_seen_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
+    )
+    listing_count: Mapped[int] = mapped_column(Integer, default=0)
+    median_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    min_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow,
+    )
+
+    # Relationships
+    price_snapshots: Mapped[list[ProductPriceSnapshot]] = relationship(
+        "ProductPriceSnapshot",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Product id={self.id} key={self.normalized_key!r} "
+            f"median={self.median_price}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ProductPriceSnapshot — снимок цены товара
+# ---------------------------------------------------------------------------
+
+class ProductPriceSnapshot(Base):
+    """Снимок цены нормализованного товара.
+
+    Записывается при каждом появлении объявления, привязанного к товару.
+    Позволяет строить временной ряд цен и стабильный baseline.
+
+    Attributes:
+        id: Первичный ключ.
+        product_id: FK на Product.
+        ad_id: FK на Ad (опционально, для связи с объявлением).
+        price: Зафиксированная цена.
+        snapshot_at: Дата-время снимка.
+        product: Связанный объект Product.
+    """
+
+    __tablename__ = "product_price_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    ad_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("ads.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    snapshot_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow,
+    )
+
+    # Relationships
+    product: Mapped[Product] = relationship("Product", back_populates="price_snapshots")
+
+    __table_args__ = (
+        Index("ix_product_price_snapshots_snapshot_at", "snapshot_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ProductPriceSnapshot id={self.id} product_id={self.product_id} "
+            f"price={self.price} at={self.snapshot_at}>"
         )

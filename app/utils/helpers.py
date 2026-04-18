@@ -11,6 +11,12 @@ from pathlib import Path
 import structlog
 
 
+def get_avito_base_url() -> str:
+    """Возвращает базовый URL Avito из настроек (lazy import)."""
+    from app.config.settings import get_settings
+    return get_settings().AVITO_BASE_URL
+
+
 async def random_delay(min_sec: float, max_sec: float) -> None:
     """Асинхронная случайная задержка с логированием.
 
@@ -210,7 +216,7 @@ def build_avito_url(query: str, location: str = "Москва") -> str:
     encoded_query = query.replace(" ", "+")
 
     return (
-        f"https://www.avito.ru/{location_slug}"
+        f"{get_avito_base_url()}/{location_slug}"
         f"?q={encoded_query}&s=104"
     )
 

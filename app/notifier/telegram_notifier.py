@@ -19,7 +19,7 @@ from app.config import get_settings
 from app.utils.exceptions import NotifierError
 
 
-SESSION_PATH = Path("data/bot_session")
+SESSION_PATH = Path(get_settings().TELEGRAM_SESSION_PATH)
 
 
 @dataclass

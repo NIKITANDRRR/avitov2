@@ -30,7 +30,8 @@ from app.storage.models import (  # noqa: F401
 from app.utils.helpers import build_avito_url
 
 # Путь к конфигурационному файлу
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "products.json"
+from app.config.settings import get_settings
+_CONFIG_PATH = Path(get_settings().PRODUCTS_CONFIG_PATH)
 
 
 def _load_products() -> list[dict]:

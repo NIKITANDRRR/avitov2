@@ -9,7 +9,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from app.utils.exceptions import ParserError
-from app.utils.helpers import extract_ad_id_from_url, normalize_url, normalize_price
+from app.utils.helpers import extract_ad_id_from_url, get_avito_base_url, normalize_url, normalize_price
 
 log = structlog.get_logger()
 
@@ -159,7 +159,7 @@ def _parse_search_item(element: "Tag") -> SearchResultItem | None:  # noqa: F821
     if link:
         href = link.get("href", "")
         if href.startswith("/"):
-            url = f"https://www.avito.ru{href}"
+            url = f"{get_avito_base_url()}{href}"
         elif href.startswith("http"):
             url = href
         if url:

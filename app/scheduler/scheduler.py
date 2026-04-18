@@ -67,9 +67,10 @@ class Scheduler:
                 logger.error("scheduler_cycle_error: %s", e, exc_info=True)
 
             if self._running and not self._shutdown:
-                logger.info("scheduler_sleeping_seconds=300")
+                cycle_interval = self.settings.SCHEDULER_CYCLE_INTERVAL_SECONDS
+                logger.info("scheduler_sleeping_seconds=%d", cycle_interval)
                 # Прерываемый сон: проверяем флаг shutdown каждую секунду
-                for _ in range(300):
+                for _ in range(cycle_interval):
                     if not self._running or self._shutdown:
                         break
                     await asyncio.sleep(1)
@@ -86,3 +87,105 @@ class Scheduler:
         logger.info("scheduler_stop_requested")
         dispose_engine()
         logger.info("scheduler_engine_disposed")
+
+
+class ConstantScheduler:
+    """Постоянный 24/7 планировщик.
+
+    Цикл: search → force-pending → sleep → repeat.
+
+    Pipeline пересоздаётся каждый цикл для очистки состояния.
+    Ошибки в одном цикле логируются, но НЕ прерывают работу.
+
+    Args:
+        settings: Конфигурация приложения. Если ``None`` —
+            создаётся экземпляр по умолчанию.
+    """
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or Settings()
+        self._running = False
+        self._shutdown = False
+        self._cycle_count = 0
+
+    def _signal_handler(self, signum: int, frame) -> None:
+        """Обработчик сигналов завершения."""
+        logger.info("constant_shutdown_signal", signal=signum)
+        self._shutdown = True
+        self._running = False
+
+    async def run(self) -> None:
+        """Основной бесконечный цикл.
+
+        Каждый цикл:
+            1. Создать ``Pipeline(settings)``.
+            2. Вызвать ``pipeline.run_constant_cycle()``.
+            3. Логировать статистику.
+            4. Закрыть pipeline (dispose engine).
+            5. Прерываемый сон на ``CONSTANT_CYCLE_INTERVAL_SECONDS``.
+            6. При shutdown — выйти из цикла.
+        """
+        signal.signal(signal.SIGINT, self._signal_handler)
+        try:
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except (OSError, ValueError):
+            pass  # SIGTERM может быть недоступен на Windows
+
+        self._running = True
+        logger.info(
+            "constant_mode_starting",
+            interval=self.settings.CONSTANT_CYCLE_INTERVAL_SECONDS,
+            force_pending=self.settings.CONSTANT_FORCE_PENDING_AFTER_SEARCH,
+        )
+
+        while self._running and not self._shutdown:
+            self._cycle_count += 1
+            cycle_num = self._cycle_count
+
+            try:
+                logger.info("constant_cycle_start", cycle=cycle_num)
+
+                pipeline = Pipeline(self.settings)
+                try:
+                    stats = await pipeline.run_constant_cycle()
+                    logger.info(
+                        "constant_cycle_complete",
+                        cycle=cycle_num,
+                        **stats,
+                    )
+                finally:
+                    dispose_engine()
+                    logger.info(
+                        "constant_cycle_engine_disposed",
+                        cycle=cycle_num,
+                    )
+
+            except Exception as exc:
+                logger.error(
+                    "constant_cycle_error",
+                    cycle=cycle_num,
+                    error=str(exc),
+                    exc_info=True,
+                )
+
+            if self._running and not self._shutdown:
+                interval = self.settings.CONSTANT_CYCLE_INTERVAL_SECONDS
+                logger.info(
+                    "constant_sleeping",
+                    cycle=cycle_num,
+                    seconds=interval,
+                    next_cycle=cycle_num + 1,
+                )
+                await self._interruptible_sleep(interval)
+
+        logger.info(
+            "constant_shutdown",
+            total_cycles=self._cycle_count,
+        )
+
+    async def _interruptible_sleep(self, seconds: int) -> None:
+        """Сон с проверкой shutdown каждую секунду."""
+        for _ in range(seconds):
+            if not self._running or self._shutdown:
+                break
+            await asyncio.sleep(1)

@@ -15,6 +15,8 @@ from app.storage.models import (
     Ad,
     AdSnapshot,
     NotificationSent,
+    Product,
+    ProductPriceSnapshot,
     SearchRun,
     Seller,
     SoldItem,
@@ -1971,6 +1973,260 @@ class Repository:
             )
             raise StorageError(
                 f"Failed to get unlinked seller ads: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Product — нормализованный товар
+    # ------------------------------------------------------------------
+
+    def get_or_create_product(
+        self,
+        normalized_key: str,
+        brand: str | None = None,
+        model: str | None = None,
+        category: str | None = None,
+    ) -> Product:
+        """Найти или создать Product по normalized_key.
+
+        Если товар с таким ключом уже существует — возвращает его.
+        Иначе — создаёт новую запись.
+
+        Args:
+            normalized_key: Нормализованный ключ товара.
+            brand: Бренд (опционально).
+            model: Модель (опционально).
+            category: Категория (опционально).
+
+        Returns:
+            Product: Найденный или созданный товар.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = select(Product).where(
+                Product.normalized_key == normalized_key,
+            )
+            existing = self.session.execute(stmt).scalars().first()
+            if existing is not None:
+                return existing
+
+            product = Product(
+                normalized_key=normalized_key,
+                brand=brand,
+                model=model,
+                category=category,
+            )
+            self.session.add(product)
+            self.session.flush()
+
+            logger.debug(
+                "product_created",
+                product_id=product.id,
+                normalized_key=normalized_key,
+            )
+            return product
+        except IntegrityError:
+            # Race condition: другой процесс уже создал
+            self.session.rollback()
+            stmt = select(Product).where(
+                Product.normalized_key == normalized_key,
+            )
+            existing = self.session.execute(stmt).scalars().first()
+            if existing is not None:
+                return existing
+            raise
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_or_create_product_failed",
+                normalized_key=normalized_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get/create product: {exc}"
+            ) from exc
+
+    def add_product_price_snapshot(
+        self,
+        product_id: int,
+        price: float,
+        ad_id: int | None = None,
+    ) -> ProductPriceSnapshot:
+        """Добавить снимок цены товара.
+
+        Args:
+            product_id: ID товара.
+            price: Цена.
+            ad_id: ID объявления (опционально).
+
+        Returns:
+            ProductPriceSnapshot: Созданный снимок.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            snapshot = ProductPriceSnapshot(
+                product_id=product_id,
+                price=price,
+                ad_id=ad_id,
+            )
+            self.session.add(snapshot)
+            self.session.flush()
+
+            logger.debug(
+                "product_price_snapshot_added",
+                product_id=product_id,
+                price=price,
+                ad_id=ad_id,
+            )
+            return snapshot
+        except SQLAlchemyError as exc:
+            logger.error(
+                "add_product_price_snapshot_failed",
+                product_id=product_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to add product price snapshot: {exc}"
+            ) from exc
+
+    def update_product_stats(self, product_id: int) -> None:
+        """Пересчитать агрегированную статистику товара.
+
+        Пересчитывает median_price, min_price, max_price, listing_count
+        на основе всех снимков цен.
+
+        Args:
+            product_id: ID товара.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            # Агрегация по снимкам
+            stats_stmt = select(
+                func.count(ProductPriceSnapshot.id).label("count"),
+                func.percentile_cont(0.5).within_group(
+                    ProductPriceSnapshot.price
+                ).label("median"),
+                func.min(ProductPriceSnapshot.price).label("min_price"),
+                func.max(ProductPriceSnapshot.price).label("max_price"),
+            ).where(ProductPriceSnapshot.product_id == product_id)
+
+            result = self.session.execute(stats_stmt).one()
+
+            product = self.session.get(Product, product_id)
+            if product is None:
+                return
+
+            product.listing_count = result.count or 0
+            product.median_price = result.median
+            product.min_price = result.min_price
+            product.max_price = result.max_price
+            product.last_seen_at = datetime.datetime.now(datetime.timezone.utc)
+
+            self.session.flush()
+
+            logger.debug(
+                "product_stats_updated",
+                product_id=product_id,
+                count=result.count,
+                median=result.median,
+            )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "update_product_stats_failed",
+                product_id=product_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to update product stats: {exc}"
+            ) from exc
+
+    def get_product_price_stats(
+        self,
+        product_id: int,
+        days: int = 30,
+    ) -> dict[str, float | int | None]:
+        """Получить статистику цен товара за указанный период.
+
+        Args:
+            product_id: ID товара.
+            days: Количество дней для анализа (по умолчанию 30).
+
+        Returns:
+            dict: Статистика с ключами median, min, max, count, p25, p75.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+
+            stats_stmt = select(
+                func.count(ProductPriceSnapshot.id).label("count"),
+                func.percentile_cont(0.5).within_group(
+                    ProductPriceSnapshot.price
+                ).label("median"),
+                func.percentile_cont(0.25).within_group(
+                    ProductPriceSnapshot.price
+                ).label("p25"),
+                func.percentile_cont(0.75).within_group(
+                    ProductPriceSnapshot.price
+                ).label("p75"),
+                func.min(ProductPriceSnapshot.price).label("min_price"),
+                func.max(ProductPriceSnapshot.price).label("max_price"),
+            ).where(
+                ProductPriceSnapshot.product_id == product_id,
+                ProductPriceSnapshot.snapshot_at >= cutoff,
+            )
+
+            result = self.session.execute(stats_stmt).one()
+
+            return {
+                "count": result.count or 0,
+                "median": result.median,
+                "p25": result.p25,
+                "p75": result.p75,
+                "min": result.min_price,
+                "max": result.max_price,
+            }
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_product_price_stats_failed",
+                product_id=product_id,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get product price stats: {exc}"
+            ) from exc
+
+    def get_product_by_key(self, normalized_key: str) -> Product | None:
+        """Найти товар по normalized_key.
+
+        Args:
+            normalized_key: Нормализованный ключ товара.
+
+        Returns:
+            Product | None: Найденный товар или None.
+
+        Raises:
+            StorageError: Ошибка при работе с БД.
+        """
+        try:
+            stmt = select(Product).where(
+                Product.normalized_key == normalized_key,
+            )
+            return self.session.execute(stmt).scalars().first()
+        except SQLAlchemyError as exc:
+            logger.error(
+                "get_product_by_key_failed",
+                normalized_key=normalized_key,
+                error=str(exc),
+            )
+            raise StorageError(
+                f"Failed to get product by key: {exc}"
             ) from exc
 
     # ------------------------------------------------------------------

@@ -10,7 +10,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from app.utils.exceptions import ParserError
-from app.utils.helpers import extract_ad_id_from_url, normalize_price, normalize_url
+from app.utils.helpers import extract_ad_id_from_url, get_avito_base_url, normalize_price, normalize_url
 
 log = structlog.get_logger()
 
@@ -142,7 +142,7 @@ def parse_ad_page(html: str, url: str) -> AdData:
 
         # Если найдена относительная ссылка, добавить домен
         if seller_url and seller_url.startswith("/"):
-            seller_url = "https://www.avito.ru" + seller_url
+            seller_url = get_avito_base_url() + seller_url
 
         # --- seller_id ---
         seller_id: str | None = None
@@ -271,7 +271,7 @@ def _extract_seller_url_from_scripts(soup: BeautifulSoup) -> str | None:
             # Ищем паттерн /user/HASH или /u/HASH в JavaScript
             match = re.search(r'["\'](?:https?://(?:www\.)?avito\.ru)?(/(?:user|u)/[^"\'/?#]+)', text)
             if match:
-                return "https://www.avito.ru" + match.group(1)
+                return get_avito_base_url() + match.group(1)
         except Exception:
             continue
 
@@ -352,7 +352,7 @@ def _extract_seller_data_from_next_data(
     if "url" in _found:
         url_val = _found["url"]
         if url_val.startswith("/"):
-            url_val = "https://www.avito.ru" + url_val
+            url_val = get_avito_base_url() + url_val
         result["seller_url"] = url_val
 
     # Попытка извлечь seller_type из __NEXT_DATA__

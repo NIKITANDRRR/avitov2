@@ -10,28 +10,28 @@ import structlog
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright
 
-# Современные User-Agent Chrome
-USER_AGENTS: list[str] = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-]
+def _get_user_agents() -> list[str]:
+    """Возвращает список User-Agent строк из настроек."""
+    from app.config.settings import get_settings
+    return get_settings().USER_AGENTS
 
-# Возможные размеры viewport
-VIEWPORTS: list[dict[str, int]] = [
-    {"width": 1920, "height": 1080},
-    {"width": 1366, "height": 768},
-    {"width": 1536, "height": 864},
-]
+
+def _get_viewports() -> list[dict[str, int]]:
+    """Возвращает список viewport размеров из настроек."""
+    from app.config.settings import get_settings
+    return get_settings().BROWSER_VIEWPORTS
+
+
+def _get_locale() -> str:
+    """Возвращает locale браузера из настроек."""
+    from app.config.settings import get_settings
+    return get_settings().BROWSER_LOCALE
+
+
+def _get_timezone() -> str:
+    """Возвращает timezone браузера из настроек."""
+    from app.config.settings import get_settings
+    return get_settings().BROWSER_TIMEZONE
 
 
 class BrowserManager:
@@ -104,10 +104,10 @@ class BrowserManager:
             dict: Параметры для ``browser.new_context()``.
         """
         kwargs: dict = {
-            "user_agent": random.choice(USER_AGENTS),
-            "viewport": random.choice(VIEWPORTS),
-            "locale": "ru-RU",
-            "timezone_id": "Europe/Moscow",
+            "user_agent": random.choice(_get_user_agents()),
+            "viewport": random.choice(_get_viewports()),
+            "locale": _get_locale(),
+            "timezone_id": _get_timezone(),
         }
 
         if self.use_proxy and self.proxy_url:
@@ -140,12 +140,12 @@ class BrowserManager:
                 "width": random.randint(1280, 1920),
                 "height": random.randint(720, 1080),
             }
-            user_agent = random.choice(USER_AGENTS)
+            user_agent = random.choice(_get_user_agents())
             context = await self._browser.new_context(
                 viewport=viewport,
                 user_agent=user_agent,
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
+                locale=_get_locale(),
+                timezone_id=_get_timezone(),
             )
 
             # Anti-detection: скрыть navigator.webdriver

@@ -507,6 +507,8 @@ class AvitoCollector:
 
         Ищет характерные индикаторы капчи в HTML-контенте:
         Cloudflare, reCAPTCHA, hCaptcha, Bitrix CAPTCHA и русскоязычные фразы.
+        Если на странице присутствуют элементы обычного контента (заголовок,
+        карточка объявления, профиль продавца), считается, что капчи нет.
 
         Args:
             html: HTML-контент страницы.
@@ -514,18 +516,37 @@ class AvitoCollector:
         Returns:
             bool: ``True``, если обнаружена страница капчи.
         """
+        # Индикаторы нормального контента — если хотя бы один присутствует,
+        # значит страница загрузилась нормально и капчи нет.
+        content_indicators = [
+            'data-marker="item-view/item-title"',
+            'data-marker="item-view/title-info"',
+            'data-marker="item"',
+            'data-marker="profile/name"',
+            '<h1',
+        ]
+        for indicator in content_indicators:
+            if indicator in html:
+                return False
+
         captcha_indicators = [
-            'captcha',
             'bitrix/tools/captcha',
-            'recaptcha',
-            'hcaptcha',
+            'recaptcha/api/challenge',
+            'hcaptcha.com/1/api.js',
             'cloudflare-challenge',
             'Проверка безопасности',
             'Подтвердите, что вы не робот',
             'Докажите, что вы человек',
         ]
         html_lower = html.lower()
-        return any(indicator.lower() in html_lower for indicator in captcha_indicators)
+        for indicator in captcha_indicators:
+            if indicator.lower() in html_lower:
+                self.logger.debug(
+                    "captcha_detected",
+                    indicator=indicator,
+                )
+                return True
+        return False
 
     async def _wait_for_selectors(
         self,

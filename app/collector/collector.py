@@ -67,6 +67,7 @@ class AvitoCollector:
         self._search_rate_limiter = search_rate_limiter
         self._ad_rate_limiter = ad_rate_limiter
         self._seller_rate_limiter = seller_rate_limiter
+        self._consecutive_captchas: int = 0
         self.logger = structlog.get_logger()
 
     async def _navigate_with_retry(
@@ -173,6 +174,26 @@ class AvitoCollector:
 
             html = await page.content()
 
+            # Проверка капчи
+            if self._detect_captcha(html):
+                self._consecutive_captchas += 1
+                self.logger.warning(
+                    "captcha_detected_search",
+                    url=url,
+                    consecutive_captchas=self._consecutive_captchas,
+                )
+                if self._consecutive_captchas >= 3:
+                    raise CollectorError(
+                        "Слишком много последовательных капч (>= 3). "
+                        "Остановка цикла сбора."
+                    )
+                await asyncio.sleep(random.uniform(30, 60))
+                raise CollectorError(
+                    f"Captcha detected on search page {url}"
+                )
+
+            self._consecutive_captchas = 0
+
             # Генерация имени файла
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"search_{timestamp}"
@@ -275,6 +296,26 @@ class AvitoCollector:
 
             html = await page.content()
 
+            # Проверка капчи
+            if self._detect_captcha(html):
+                self._consecutive_captchas += 1
+                self.logger.warning(
+                    "captcha_detected_ad",
+                    url=url,
+                    consecutive_captchas=self._consecutive_captchas,
+                )
+                if self._consecutive_captchas >= 3:
+                    raise CollectorError(
+                        "Слишком много последовательных капч (>= 3). "
+                        "Остановка цикла сбора."
+                    )
+                await asyncio.sleep(random.uniform(30, 60))
+                raise CollectorError(
+                    f"Captcha detected on ad page {url}"
+                )
+
+            self._consecutive_captchas = 0
+
             # Генерация имени файла
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"ad_{timestamp}"
@@ -323,17 +364,19 @@ class AvitoCollector:
         self,
         seller_url: str,
         tab: str = "sold",
+        page_num: int = 1,
         context: "BrowserContext | None" = None,
     ) -> tuple[str | None, str | None]:
         """Загрузить страницу профиля продавца и вернуть ``(html, final_url)``.
 
         Выполняет случайную задержку перед открытием, загружает страницу
-        профиля продавца (с указанной вкладкой), ожидает появления контента,
-        имитирует скролл и возвращает HTML и итоговый URL.
+        профиля продавца (с указанной вкладкой и номером страницы), ожидает
+        появления контента, имитирует скролл и возвращает HTML и итоговый URL.
 
         Args:
             seller_url: URL профиля продавца на Avito.
             tab: Вкладка профиля (``'sold'`` для проданных товаров).
+            page_num: Номер страницы профиля (начиная с 1).
             context: Опциональный изолированный контекст браузера.
                 Если передан — страница создаётся из него.
 
@@ -344,11 +387,14 @@ class AvitoCollector:
         Raises:
             CollectorError: Если не удалось загрузить страницу.
         """
-        # Формируем итоговый URL с вкладкой
+        # Формируем итоговый URL с вкладкой и пагинацией
         target_url = seller_url
         if tab == "sold":
             separator = "&" if "?" in seller_url else "?"
             target_url = f"{seller_url}{separator}tab=sold"
+        if page_num > 1:
+            separator = "&" if "?" in target_url else "?"
+            target_url = f"{target_url}{separator}page={page_num}"
 
         if context is not None:
             page = await context.new_page()
@@ -391,6 +437,26 @@ class AvitoCollector:
 
             html = await page.content()
             final_url = page.url
+
+            # Проверка капчи
+            if self._detect_captcha(html):
+                self._consecutive_captchas += 1
+                self.logger.warning(
+                    "captcha_detected_seller",
+                    url=target_url,
+                    consecutive_captchas=self._consecutive_captchas,
+                )
+                if self._consecutive_captchas >= 3:
+                    raise CollectorError(
+                        "Слишком много последовательных капч (>= 3). "
+                        "Остановка цикла сбора."
+                    )
+                await asyncio.sleep(random.uniform(30, 60))
+                raise CollectorError(
+                    f"Captcha detected on seller page {target_url}"
+                )
+
+            self._consecutive_captchas = 0
 
             # Сохранение HTML для отладки
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

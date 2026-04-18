@@ -62,15 +62,15 @@ class Settings(BaseSettings):
 
     # Collection limits
     MAX_SEARCH_PAGES_PER_RUN: int = Field(default=50, ge=1, le=100)
-    MAX_ADS_PER_SEARCH_PER_RUN: int = Field(default=3, ge=1, le=10)
+    MAX_ADS_PER_SEARCH_PER_RUN: int = Field(default=10, ge=1, le=10)
 
     # Delays (seconds)
     MIN_DELAY_SECONDS: float = Field(
-        default=3.0, ge=1.0,
+        default=4.0, ge=1.0,
         description="Минимальная задержка между запросами (сек)",
     )
     MAX_DELAY_SECONDS: float = Field(
-        default=8.0, ge=1.0,
+        default=10.0, ge=1.0,
         description="Максимальная задержка между запросами (сек)",
     )
     STARTUP_DELAY_MIN: float = Field(default=0.0, ge=0.0)
@@ -214,7 +214,7 @@ class Settings(BaseSettings):
         description="Интервал запуска по умолчанию (часы)",
     )
     DEFAULT_MAX_ADS_TO_PARSE: int = Field(
-        default=3,
+        default=10,
         ge=1,
         le=50,
         description="Карточек на поиск за запуск по умолчанию",
@@ -276,13 +276,13 @@ class Settings(BaseSettings):
 
     # === Раздельные rate limiter'ы ===
     SEARCH_RATE_LIMIT_PER_MINUTE: int = Field(
-        default=6,
+        default=8,
         ge=1,
         le=30,
         description="Максимум запросов поиска в минуту",
     )
     AD_RATE_LIMIT_PER_MINUTE: int = Field(
-        default=8,
+        default=10,
         ge=1,
         le=30,
         description="Максимум запросов карточек в минуту",
@@ -300,10 +300,16 @@ class Settings(BaseSettings):
         description="Rate limit для запросов к профилям (запросов/мин)",
     )
     SELLER_MAX_PROFILES_PER_CYCLE: int = Field(
-        default=5,
+        default=10,
         ge=1,
         le=50,
         description="Макс. кол-во профилей за один цикл",
+    )
+    SELLER_MAX_PAGES_PER_PROFILE: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Максимальное количество страниц профиля продавца для парсинга",
     )
     SELLER_SCRAPE_INTERVAL_HOURS: float = Field(
         default=24.0,

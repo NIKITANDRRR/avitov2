@@ -1373,61 +1373,99 @@ class Pipeline:
                 continue
 
             try:
-                html, final_url = await collector.collect_seller_page(
-                    seller.seller_url, tab="sold",
-                )
+                max_pages = settings.SELLER_MAX_PAGES_PER_PROFILE
+                all_sold_items: list[dict] = []
+                profile_updated = False
 
-                if html is not None:
-                    profile: SellerProfileData = parse_seller_profile(
-                        html, url=final_url or seller.seller_url,
+                for page_num in range(1, max_pages + 1):
+                    if page_num > 1:
+                        await asyncio.sleep(
+                            random.uniform(
+                                settings.SELLER_PAGE_DELAY_MIN,
+                                settings.SELLER_PAGE_DELAY_MAX,
+                            )
+                        )
+
+                    html, final_url = await collector.collect_seller_page(
+                        seller.seller_url, tab="sold", page_num=page_num,
                     )
 
-                    repo.update_seller(
-                        seller.seller_id,
-                        seller_name=profile.seller_name,
-                        rating=profile.rating,
-                        reviews_count=profile.reviews_count,
-                        total_sold_items=profile.total_sold_items,
-                        last_scraped_at=datetime.now(timezone.utc),
-                        scrape_status="scraped",
-                    )
+                    if html is not None:
+                        profile: SellerProfileData = parse_seller_profile(
+                            html, url=final_url or seller.seller_url,
+                        )
 
-                    if profile.sold_items:
-                        items_dicts = [
-                            {
-                                "item_id": item.item_id,
-                                "title": item.title,
-                                "price": item.price,
-                                "price_str": item.price_str,
-                                "category": item.category,
-                                "sold_date": item.sold_date,
-                                "item_url": item.item_url,
-                            }
-                            for item in profile.sold_items
-                        ]
-                        saved = repo.save_sold_items(
-                            seller_db_id=seller.id,
-                            items=items_dicts,
-                        )
-                        self.logger.info(
-                            "seller_profile_scraped",
-                            seller_id=seller.seller_id,
-                            sold_items_count=len(profile.sold_items),
-                            sold_items_saved=saved,
-                        )
+                        # Обновляем данные продавца только один раз (по первой странице)
+                        if not profile_updated:
+                            repo.update_seller(
+                                seller.seller_id,
+                                seller_name=profile.seller_name,
+                                rating=profile.rating,
+                                reviews_count=profile.reviews_count,
+                                total_sold_items=profile.total_sold_items,
+                                last_scraped_at=datetime.now(timezone.utc),
+                                scrape_status="scraped",
+                            )
+                            profile_updated = True
+
+                        if profile.sold_items:
+                            page_items = [
+                                {
+                                    "item_id": item.item_id,
+                                    "title": item.title,
+                                    "price": item.price,
+                                    "price_str": item.price_str,
+                                    "category": item.category,
+                                    "sold_date": item.sold_date,
+                                    "item_url": item.item_url,
+                                }
+                                for item in profile.sold_items
+                            ]
+                            all_sold_items.extend(page_items)
+                            self.logger.info(
+                                "seller_profile_page_scraped",
+                                seller_id=seller.seller_id,
+                                page=page_num,
+                                page_sold_items=len(profile.sold_items),
+                            )
+                        else:
+                            self.logger.info(
+                                "seller_profile_page_no_sold_items",
+                                seller_id=seller.seller_id,
+                                page=page_num,
+                            )
+                            # Если на странице нет проданных товаров — дальше нет смысла
+                            break
                     else:
-                        self.logger.info(
-                            "seller_profile_scraped_no_sold_items",
+                        self.logger.warning(
+                            "seller_page_html_empty",
                             seller_id=seller.seller_id,
+                            page=page_num,
                         )
-                else:
-                    self.logger.warning(
-                        "seller_page_html_empty",
-                        seller_id=seller.seller_id,
+                        repo.update_seller(
+                            seller.seller_id,
+                            scrape_status="failed",
+                        )
+                        break
+
+                # Сохраняем все собранные проданные товары
+                if all_sold_items:
+                    saved = repo.save_sold_items(
+                        seller_db_id=seller.id,
+                        items=all_sold_items,
                     )
-                    repo.update_seller(
-                        seller.seller_id,
-                        scrape_status="failed",
+                    self.logger.info(
+                        "seller_profile_scraped",
+                        seller_id=seller.seller_id,
+                        total_pages_parsed=page_num,
+                        total_sold_items=len(all_sold_items),
+                        sold_items_saved=saved,
+                    )
+                elif profile_updated:
+                    self.logger.info(
+                        "seller_profile_scraped_no_sold_items",
+                        seller_id=seller.seller_id,
+                        total_pages_parsed=page_num,
                     )
 
             except Exception as exc:

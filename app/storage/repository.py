@@ -1137,6 +1137,7 @@ class Repository:
         segment_stats_id: int,
         snapshot_date: datetime.date,
         data: dict,
+        segment_key: str | None = None,
     ) -> SegmentPriceHistory:
         """Создаёт или обновляет снапшот истории цен для сегмента.
 
@@ -1149,6 +1150,7 @@ class Repository:
                 ``min_price``, ``max_price``, ``sample_size``,
                 ``listing_count``, ``fast_sale_count``,
                 ``median_days_on_market``.
+            segment_key: Ключ сегмента (обязателен для новых записей).
 
         Returns:
             SegmentPriceHistory: Привязанный к сессии объект.
@@ -1178,6 +1180,7 @@ class Repository:
 
             snapshot = SegmentPriceHistory(
                 segment_stats_id=segment_stats_id,
+                segment_key=segment_key or "",
                 snapshot_date=snapshot_date,
                 **{k: v for k, v in data.items() if hasattr(SegmentPriceHistory, k)},
             )
@@ -2018,7 +2021,32 @@ class Repository:
                 category=category,
             )
             self.session.add(product)
-            self.session.flush()
+            savepoint = self.session.begin_nested()
+            try:
+                self.session.flush()
+                savepoint.commit()
+            except IntegrityError:
+                # Race condition: другой параллельный запрос уже вставил эту запись.
+                # Откатываем только SAVEPOINT, не трогая основную транзакцию.
+                savepoint.rollback()
+                logger.warning(
+                    "get_or_create_product_savepoint_rollback",
+                    normalized_key=normalized_key,
+                )
+                self.session.expire_all()
+                stmt = select(Product).where(
+                    Product.normalized_key == normalized_key,
+                )
+                existing = self.session.execute(stmt).scalars().first()
+                if existing is not None:
+                    logger.info(
+                        "product_created_by_another_thread",
+                        normalized_key=normalized_key,
+                        product_id=existing.id,
+                    )
+                    return existing
+                # Если всё ещё не найден — пробросим оригинальную ошибку
+                raise
 
             logger.debug(
                 "product_created",
@@ -2026,16 +2054,15 @@ class Repository:
                 normalized_key=normalized_key,
             )
             return product
-        except IntegrityError:
-            # Race condition: другой процесс уже создал
-            self.session.rollback()
-            stmt = select(Product).where(
-                Product.normalized_key == normalized_key,
+        except IntegrityError as exc:
+            logger.error(
+                "get_or_create_product_integrity_error",
+                normalized_key=normalized_key,
+                error=str(exc),
             )
-            existing = self.session.execute(stmt).scalars().first()
-            if existing is not None:
-                return existing
-            raise
+            raise StorageError(
+                f"Failed to get or create product (integrity): {exc}"
+            ) from exc
         except SQLAlchemyError as exc:
             logger.error(
                 "get_or_create_product_failed",

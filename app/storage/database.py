@@ -86,8 +86,6 @@ def get_session():
 
 def ensure_tables() -> None:
     """Создаёт таблицы, если они не существуют."""
-    from app.storage.models import (  # noqa: F401
-        Ad, AdSnapshot, NotificationSent, SearchRun, TrackedSearch,
-    )
+    import app.storage.models  # noqa: F401 — регистрирует все модели в Base.metadata
     engine = get_engine()
     Base.metadata.create_all(engine)

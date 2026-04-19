@@ -180,10 +180,15 @@ class Settings(BaseSettings):
 
     # === Настройки детекции бриллиантов ===
     DIAMOND_DISCOUNT_THRESHOLD: float = Field(
-        default=0.85,
+        default=0.70,
         gt=0.5,
         le=1.0,
-        description="Порог price/median для детекции бриллиантов (0.85 = 15% ниже медианы)",
+        description="Порог price/median для детекции бриллиантов (0.70 = 30% ниже медианы)",
+    )
+    DIAMOND_MIN_PRICE: float = Field(
+        default=10000.0,
+        ge=0.0,
+        description="Минимальная цена товара для уведомления о бриллианте (руб.)",
     )
     DIAMOND_MIN_SNAPSHOTS: int = Field(
         default=3,

@@ -1,5 +1,23 @@
 # Release Notes — Avito Price Monitor
 
+## [0.8.0] - 2026-04-19
+
+### Fixed
+- **Constant mode first cycle**: первый цикл теперь запускает все поиски принудительно (force_all), а не ждёт расписания
+- **segment_price_history NotNullViolation**: поле `segment_key` добавлено в SQLAlchemy-модель и передаётся при INSERT
+- **get_or_create_product() session rollback**: заменён полный `session.rollback()` на savepoint (`begin_nested()`), аналогично другим `get_or_create_*` методам
+- **ensure_tables()**: теперь импортирует все модели (ранее только 5 из 10), что гарантирует создание всех таблиц
+
+### Changed
+- `run_constant_cycle()` принимает параметр `force_all: bool` для принудительного запуска всех поисков
+- `ConstantScheduler.run()` передаёт `force_all=True` на первом цикле
+
+### Removed
+- Устаревшие скрипты: `_fix_rollback.py`, `cleanup_duplicates.py`, `renormalize_products.py`
+- Устаревшие документы: `fix_plan.md`, `implementation_plan.md`, `improvements_plan.md`, `project_analysis.md`
+- Устаревшие планы: `diamond_detection_product_first.md`, `normalizer_v2_plan.md`
+- `project_start.txt`
+
 ## [2026-04-17] — Улучшения парсинга и режим force-pending
 
 ### Новое

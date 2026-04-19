@@ -311,6 +311,7 @@ class SegmentAnalyzer:
 
         median_price = float(np.median(prices_arr))
         mean_price = float(np.mean(prices_arr))
+        std_dev = float(np.std(prices_arr, ddof=1)) if len(prices) >= 2 else 0.0
 
         stats = SegmentStats(
             segment_key=segment_key.to_string(),
@@ -321,6 +322,7 @@ class SegmentAnalyzer:
             min_price=float(np.min(prices_arr)),
             max_price=float(np.max(prices_arr)),
             listing_price_median=median_price,
+            std_dev=std_dev,
             calculated_at=datetime.datetime.now(datetime.timezone.utc),
         )
 
@@ -490,6 +492,7 @@ class SegmentAnalyzer:
         repo: Any,
         segment_stats_id: int,
         stats: dict,
+        segment_key: str = "",
     ) -> None:
         """Сохраняет ежедневный/еженедельный снапшот истории цен сегмента.
 
@@ -501,6 +504,7 @@ class SegmentAnalyzer:
             repo: Экземпляр репозитория.
             segment_stats_id: ID записи SegmentStats.
             stats: Словарь со статистикой сегмента.
+            segment_key: Ключ сегмента (для заполнения NOT NULL колонки).
         """
         snapshot_days = self._get_setting("segment_history_snapshot_days", 7)
         today = datetime.date.today()
@@ -535,6 +539,7 @@ class SegmentAnalyzer:
                 segment_stats_id=segment_stats_id,
                 snapshot_date=today,
                 data=snapshot_data,
+                segment_key=segment_key,
             )
             self._log.info(
                 "segment_snapshot_saved",
@@ -821,6 +826,7 @@ class SegmentAnalyzer:
                     'liquid_market_estimate': stats_obj.liquid_market_estimate,
                     'median_days_on_market': stats_obj.median_days_on_market,
                     'appearance_count_90d': stats_obj.appearance_count_90d or 0,
+                    'std_dev': stats_obj.std_dev or 0.0,
                 }
 
                 # 2b. Рассчитать тренд цены
@@ -873,6 +879,7 @@ class SegmentAnalyzer:
                 # 2g. Сохранить снапшот истории
                 self.save_segment_snapshot(
                     repo, saved_stats.id, stats_dict,
+                    segment_key=segment_key_str,
                 )
 
                 results[segment_key_str] = stats_dict

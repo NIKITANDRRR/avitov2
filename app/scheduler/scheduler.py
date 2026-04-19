@@ -141,13 +141,20 @@ class ConstantScheduler:
         while self._running and not self._shutdown:
             self._cycle_count += 1
             cycle_num = self._cycle_count
+            is_first_cycle = cycle_num == 1
 
             try:
-                logger.info("constant_cycle_start", cycle=cycle_num)
+                logger.info(
+                    "constant_cycle_start",
+                    cycle=cycle_num,
+                    force_all=is_first_cycle,
+                )
 
                 pipeline = Pipeline(self.settings)
                 try:
-                    stats = await pipeline.run_constant_cycle()
+                    stats = await pipeline.run_constant_cycle(
+                        force_all=is_first_cycle,
+                    )
                     logger.info(
                         "constant_cycle_complete",
                         cycle=cycle_num,

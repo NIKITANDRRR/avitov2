@@ -432,26 +432,52 @@ class Pipeline:
         )
         return self.stats
 
-    async def run_constant_cycle(self) -> dict[str, int]:
+    async def run_constant_cycle(
+        self,
+        force_all: bool = False,
+    ) -> dict[str, int]:
         """Один цикл constant режима: search → force-pending.
 
         Алгоритм:
             1. Сбросить статистику.
             2. Вызвать ``run_search_cycle()`` — сбор новых объявлений.
+               Если *force_all* — передать все активные поиски
+               принудительно (полезно для первого цикла).
             3. Если ``CONSTANT_FORCE_PENDING_AFTER_SEARCH=True`` и есть
                pending объявления — вызвать ``run_force_pending_cycle()``.
             4. Вернуть объединённую статистику.
 
+        Args:
+            force_all: Если ``True`` — принудительно запустить ВСЕ
+                активные поиски, игнорируя расписание.  Используется
+                на первом цикле constant-режима.
+
         Returns:
             dict[str, int]: Объединённая статистика цикла.
         """
-        self.logger.info("constant_cycle_start")
+        self.logger.info("constant_cycle_start", force_all=force_all)
 
         # 1. Сброс статистики
         self.stats = {k: 0 for k in self.stats}
 
         # 2. Сбор новых объявлений
-        search_stats = await self.run_search_cycle()
+        forced_searches = None
+        if force_all:
+            try:
+                session = get_session()
+                repo = Repository(session)
+                try:
+                    forced_searches = repo.get_active_searches()
+                finally:
+                    repo.close()
+            except Exception as exc:
+                self.logger.error(
+                    "constant_cycle_force_all_failed",
+                    error=str(exc),
+                    exc_info=True,
+                )
+
+        search_stats = await self.run_search_cycle(searches=forced_searches)
         self.logger.info(
             "constant_cycle_search_done",
             searches_processed=search_stats.get("searches_processed", 0),
@@ -2221,6 +2247,16 @@ class Pipeline:
 
             if ratio >= discount_threshold:
                 continue  # Не бриллиант
+
+            # Фильтр по минимальной цене
+            if ad.price < self.settings.DIAMOND_MIN_PRICE:
+                self.logger.debug(
+                    "diamond_skipped_min_price",
+                    ad_id=ad.ad_id,
+                    price=ad.price,
+                    min_price=self.settings.DIAMOND_MIN_PRICE,
+                )
+                continue
 
             # --- Создание DiamondAlert ---
             discount_percent = (1 - ratio) * 100

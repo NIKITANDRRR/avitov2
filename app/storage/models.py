@@ -532,6 +532,9 @@ class SegmentStats(Base):
     # Тренд
     price_trend_slope: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Стандартное отклонение
+    std_dev: Mapped[float | None] = mapped_column(Float, nullable=True, default=0.0)
+
     # Объём
     sample_size: Mapped[int] = mapped_column(Integer, default=0)
     listing_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -607,6 +610,7 @@ class SegmentPriceHistory(Base):
         ForeignKey("segment_stats.id", ondelete="CASCADE"),
         nullable=False,
     )
+    segment_key: Mapped[str] = mapped_column(String(512), nullable=False)
     snapshot_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
 
     # Цены на дату

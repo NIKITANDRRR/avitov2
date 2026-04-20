@@ -1148,7 +1148,8 @@ class Repository:
             snapshot_date: Дата снапшота.
             data: Словарь с полями: ``median_price``, ``mean_price``,
                 ``min_price``, ``max_price``, ``sample_size``,
-                ``listing_count``, ``fast_sale_count``,
+                ``ad_count``, ``listing_count``, ``fast_sale_count``,
+                ``new_listings_count``, ``disappeared_count``,
                 ``median_days_on_market``.
             segment_key: Ключ сегмента (обязателен для новых записей).
 

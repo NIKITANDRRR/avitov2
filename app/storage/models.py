@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DynamicMapped, Mapped, mapped_column, relationship
 
@@ -595,8 +596,11 @@ class SegmentPriceHistory(Base):
         min_price: Минимальная цена на дату.
         max_price: Максимальная цена на дату.
         sample_size: Размер выборки на дату.
+        ad_count: Количество объявлений в сегменте на дату.
         listing_count: Количество объявлений на дату.
         fast_sale_count: Количество быстрых продаж на дату.
+        new_listings_count: Количество новых объявлений на дату.
+        disappeared_count: Количество исчезнувших объявлений на дату.
         median_days_on_market: Медиана дней на рынке на дату.
         created_at: Дата-время создания записи.
         segment_stats: Связанный объект SegmentStats.
@@ -611,18 +615,31 @@ class SegmentPriceHistory(Base):
         nullable=False,
     )
     segment_key: Mapped[str] = mapped_column(String(512), nullable=False)
-    snapshot_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+    snapshot_date: Mapped[datetime.date] = mapped_column(
+        Date, nullable=False, server_default=text("CURRENT_DATE"),
+    )
 
     # Цены на дату
     median_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     mean_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     min_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    sample_size: Mapped[int] = mapped_column(
+        Integer, server_default="0",
+    )
+    ad_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0",
+    )
 
     # Оборачиваемость на дату
-    listing_count: Mapped[int] = mapped_column(Integer, default=0)
-    fast_sale_count: Mapped[int] = mapped_column(Integer, default=0)
+    listing_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    fast_sale_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    new_listings_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0",
+    )
+    disappeared_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0",
+    )
     median_days_on_market: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Метаданные

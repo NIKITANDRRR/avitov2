@@ -1,4 +1,4 @@
-"""Миграция БД: добавление поддержки категорийного мониторинга.
+"""М                                                                играция БД: добавление поддержки категорийного мониторинга.
 
 Запуск:
     python -m scripts.migrate_category_monitoring
@@ -101,17 +101,17 @@ CREATE INDEX IF NOT EXISTS idx_segment_stats_calculated
 CREATE TABLE IF NOT EXISTS segment_price_history (
     id SERIAL PRIMARY KEY,
     segment_key VARCHAR(512) NOT NULL,
-    date DATE NOT NULL,
+                    snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
     median_price FLOAT,
     ad_count INTEGER NOT NULL DEFAULT 0,
     mean_price FLOAT,
-    new_listings_count INTEGER DEFAULT 0,
-    disappeared_count INTEGER DEFAULT 0,
+    new_listings_count INTEGER NOT NULL DEFAULT 0,
+    disappeared_count INTEGER NOT NULL DEFAULT 0,
     median_days_on_market FLOAT DEFAULT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_segment_price_history_key_date
-    ON segment_price_history(segment_key, date);
+    ON segment_price_history(segment_key, snapshot_date);
 
 -- 6. Новые поля в segment_stats (трекинг объёма предложения)
 ALTER TABLE segment_stats

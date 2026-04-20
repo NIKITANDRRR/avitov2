@@ -530,8 +530,11 @@ class SegmentAnalyzer:
                 'min_price': stats.get('min_price'),
                 'max_price': stats.get('max_price'),
                 'sample_size': stats.get('sample_size', 0) or 0,
+                'ad_count': stats.get('ad_count', stats.get('sample_size', 0)) or 0,
                 'listing_count': stats.get('listing_count', 0) or 0,
                 'fast_sale_count': stats.get('fast_sale_count', 0) or 0,
+                'new_listings_count': stats.get('new_listings_count', 0) or 0,
+                'disappeared_count': stats.get('disappeared_count', 0) or 0,
                 'median_days_on_market': stats.get('median_days_on_market'),
             }
 
@@ -812,6 +815,7 @@ class SegmentAnalyzer:
                     'location': segment_key.location or 'unknown',
                     'seller_type': 'unknown',
                     'sample_size': stats_obj.sample_size or 0,
+                    'ad_count': stats_obj.sample_size or 0,
                     'listing_count': stats_obj.listing_count or 0,
                     'median_price': stats_obj.listing_price_median,
                     'mean_price': stats_obj.mean_price,
@@ -890,6 +894,12 @@ class SegmentAnalyzer:
                     segment_key=segment_key_str,
                     error=str(exc),
                 )
+                # Откатываем session, чтобы одна ошибка не ломала
+                # все последующие операции на этой сессии
+                try:
+                    repo.session.rollback()
+                except Exception:
+                    pass
 
         self._log.info(
             "segments_analyzed",
@@ -1290,3 +1300,5 @@ class SegmentAnalyzer:
             )
 
         return None
+        return None
+

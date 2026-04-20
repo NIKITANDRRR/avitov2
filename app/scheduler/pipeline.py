@@ -32,6 +32,10 @@ from app.utils.helpers import RateLimiter
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
 
+# Невалидные seller_id — артефакты парсинга Avito
+# (например "review" из URL https://www.avito.ru/user/review)
+_INVALID_SELLER_IDS: frozenset[str] = frozenset({"review", "favorites", "blocked"})
+
 
 class Pipeline:
     """Оркестратор одного цикла сбора и анализа данных Avito.
@@ -879,10 +883,15 @@ class Pipeline:
     ) -> None:
         """Обработать один отслеживаемый поиск с семафором.
 
+        Каждая параллельная задача создаёт свою собственную
+        session / Repository, чтобы rollback при ошибке не
+        закрывал транзакцию для остальных задач.
+
         Args:
             search: Отслеживаемый поиск из БД.
             collector: Экземпляр сборщика.
-            repo: Экземпляр репозитория.
+            repo: Экземпляр репозитория (не используется напрямую,
+                сохранён для совместимости сигнатуры).
             analyzer: Экземпляр анализатора цен.
             semaphore: Семафор для ограничения параллельности.
             is_warmup: Флаг warm-up режима (последовательная обработка).
@@ -892,6 +901,10 @@ class Pipeline:
         async with semaphore:
             search_start = time.monotonic()
             context = None
+
+            # Изолированная session/repo для каждого параллельного поиска
+            search_session = get_session()
+            search_repo = Repository(search_session)
             try:
                 # Задержка между поисками в батче
                 delay = (
@@ -917,7 +930,7 @@ class Pipeline:
                 await self._process_search(
                     search.search_url,
                     collector,
-                    repo,
+                    search_repo,
                     max_ads=max_ads,
                     is_warmup=is_warmup,
                     ad_concurrency=ad_concurrency,
@@ -925,7 +938,9 @@ class Pipeline:
                 )
 
                 # Обновляем last_run_at
-                repo.update_search_last_run(search.id)
+                search_repo.update_search_last_run(search.id)
+
+                search_session.commit()
 
                 self.stats["searches_processed"] += 1
                 self.logger.info(
@@ -943,9 +958,14 @@ class Pipeline:
                     search_url=search.search_url,
                     error=str(exc),
                 )
+                try:
+                    search_session.rollback()
+                except Exception:
+                    pass
             finally:
                 if context is not None:
                     await collector.browser.close_context(context)
+                search_session.close()
 
     async def _process_search(
         self,
@@ -1017,27 +1037,37 @@ class Pipeline:
             async def _process_ad_safe(
                 item: SearchResultItem,
             ) -> str | None:
-                """Обёртка для параллельной обработки с семафором."""
+                """Обёртка для параллельной обработки с семафором.
+
+                Каждая параллельная задача создаёт свою собственную
+                session / Repository, чтобы rollback при ошибке не
+                закрывал транзакцию для остальных задач.
+                """
                 async with ad_semaphore:
+                    ad_session = get_session()
+                    ad_repo = Repository(ad_session)
                     try:
-                        return await self._process_ad(
-                            item, search_url, collector, repo,
+                        result = await self._process_ad(
+                            item, search_url, collector, ad_repo,
                             context=context,
                         )
+                        ad_session.commit()
+                        return result
                     except Exception as exc:
                         run_errors_counter[0] += 1
                         self.stats["errors"] += 1
-                        if not repo.session.is_active:
-                            try:
-                                repo.session.rollback()
-                            except Exception:
-                                pass
+                        try:
+                            ad_session.rollback()
+                        except Exception:
+                            pass
                         self.logger.error(
                             "ad_processing_failed",
                             url=item.url,
                             error=str(exc),
                         )
                         return None
+                    finally:
+                        ad_session.close()
 
             # --- Цикл по страницам пагинации ---
             all_new_items: list[SearchResultItem] = []
@@ -1157,6 +1187,16 @@ class Pipeline:
             new_items = all_new_items[:max_ads]
             run_ads_new = len(new_items)
             self.stats["ads_new"] += run_ads_new
+
+            # ✅ ВАЖНО: фикс видимости между session
+            # Коммитим созданные объявления ДО параллельной обработки
+            if new_items:
+                repo.session.commit()
+                self.logger.debug(
+                    "ads_committed_before_processing",
+                    search_url=search_url,
+                    count=len(new_items),
+                )
 
             self.logger.info(
                 "pagination_summary",
@@ -1353,6 +1393,13 @@ class Pipeline:
         ad_id = extract_ad_id_from_url(search_item.url)
         normalized_url = normalize_url(search_item.url)
 
+        # Восстановление сессии если она в failed состоянии
+        if not repo.session.is_active:
+            try:
+                repo.session.rollback()
+            except Exception:
+                pass
+
         savepoint = repo.session.begin_nested()
         try:
             # Задержка уже присутствует внутри collector.collect_ad_page()
@@ -1387,23 +1434,33 @@ class Pipeline:
 
             # --- Привязка объявления к продавцу ---
             if ad_data.seller_id is not None:
-                try:
-                    seller = repo.get_or_create_seller(
-                        seller_id=ad_data.seller_id,
-                        seller_url=ad_data.seller_url,
-                        seller_name=ad_data.seller_name,
-                    )
-                    repo.link_ad_to_seller(
-                        ad_db_id=ad_record.id,
-                        seller_id_fk=seller.id,
-                    )
-                except Exception as seller_exc:
-                    self.logger.warning(
-                        "seller_link_failed",
+                if ad_data.seller_id.lower() in _INVALID_SELLER_IDS:
+                    self.logger.debug(
+                        "seller_link_skipped_invalid_id",
                         ad_id=ad_id,
                         seller_id=ad_data.seller_id,
-                        error=str(seller_exc),
                     )
+                else:
+                    seller_sp = repo.session.begin_nested()
+                    try:
+                        seller = repo.get_or_create_seller(
+                            seller_id=ad_data.seller_id,
+                            seller_url=ad_data.seller_url,
+                            seller_name=ad_data.seller_name,
+                        )
+                        repo.link_ad_to_seller(
+                            ad_id=ad_record.id,
+                            seller_id_fk=seller.id,
+                        )
+                        seller_sp.commit()
+                    except Exception as seller_exc:
+                        seller_sp.rollback()
+                        self.logger.warning(
+                            "seller_link_failed",
+                            ad_id=ad_id,
+                            seller_id=ad_data.seller_id,
+                            error=str(seller_exc),
+                        )
 
             # --- Трекинг оборачиваемости: обновить last_seen_at ---
             try:
@@ -1437,6 +1494,7 @@ class Pipeline:
 
             # --- Нормализация товара и запись в Product ---
             if ad_data.title and ad_data.price and ad_data.price > 0:
+                product_sp = repo.session.begin_nested()
                 try:
                     norm = normalize_title(ad_data.title)
                     product = repo.get_or_create_product(
@@ -1450,9 +1508,9 @@ class Pipeline:
                         price=ad_data.price,
                         ad_id=ad_record.id,
                     )
-                    # update_product_stats убран из hot-path:
-                    # теперь вызывается батчем в _process_search
+                    product_sp.commit()
                 except Exception as product_exc:
+                    product_sp.rollback()
                     self.logger.warning(
                         "product_normalization_failed",
                         ad_id=ad_id,
@@ -1472,6 +1530,11 @@ class Pipeline:
 
         except Exception as exc:
             savepoint.rollback()
+            # Полный rollback для восстановления сессии (иначе будет "transaction is closed")
+            try:
+                repo.session.rollback()
+            except Exception:
+                pass
             self.stats["errors"] += 1
             self.logger.error(
                 "ad_card_failed",

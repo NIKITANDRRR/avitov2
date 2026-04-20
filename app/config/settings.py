@@ -209,7 +209,7 @@ class Settings(BaseSettings):
         description="Включить фильтрацию аксессуаров и мелочевки"
     )
     MIN_PRICE_FILTER: int = Field(
-        default=5000,
+        default=10000,
         description="Минимальная цена товара для анализа (руб.)"
     )
     ACCESSORY_BLACKLIST: list[str] = Field(

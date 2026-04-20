@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
@@ -1005,65 +1005,131 @@ class Repository:
             StorageError: Ошибка при работе с БД.
         """
         try:
-            savepoint = self.session.begin_nested()
-            try:
-                stmt = (
-                    select(SegmentStats)
-                    .where(SegmentStats.search_id == search_id)
-                    .where(SegmentStats.segment_key == segment_key)
-                )
-                existing = self.session.execute(stmt).scalar_one_or_none()
+            # Гарантируем, что NOT NULL колонки имеют значения
+            _not_null_defaults = {
+                "category": "unknown",
+                "brand": "unknown",
+                "model": "unknown",
+                "condition": "unknown",
+                "location": "unknown",
+                "seller_type": "unknown",
+            }
+            filtered_stats = {
+                k: v for k, v in stats.items() if hasattr(SegmentStats, k)
+            }
+            for col, default in _not_null_defaults.items():
+                filtered_stats.setdefault(col, default)
+                if filtered_stats[col] is None:
+                    filtered_stats[col] = default
 
-                if existing is not None:
-                    for key, value in stats.items():
-                        if hasattr(existing, key):
-                            setattr(existing, key, value)
-                    existing.calculated_at = datetime.datetime.now(datetime.timezone.utc)
-                    existing.updated_at = datetime.datetime.now(datetime.timezone.utc)
-                    self.session.flush()
-                    logger.debug(
-                        "segment_stats_updated",
-                        search_id=search_id,
-                        segment_key=segment_key,
-                    )
-                    savepoint.commit()
-                    return existing
+            # Подготовка параметров для INSERT
+            params = {
+                "search_id": search_id,
+                "segment_key": segment_key,
+            }
+            # Все остальные колонки (кроме id, calculated_at, updated_at)
+            column_defaults = {
+                "segment_name": None,
+                "category": "unknown",
+                "brand": "unknown",
+                "model": "unknown",
+                "condition": "unknown",
+                "location": "unknown",
+                "seller_type": "unknown",
+                "median_7d": None,
+                "median_30d": None,
+                "median_90d": None,
+                "mean_price": None,
+                "min_price": None,
+                "max_price": None,
+                "price_trend_slope": None,
+                "std_dev": None,
+                "sample_size": 0,
+                "listing_count": 0,
+                "ad_count": 0,
+                "appearance_count_90d": 0,
+                "median_days_on_market": None,
+                "listing_price_median": None,
+                "fast_sale_price_median": None,
+                "liquid_market_estimate": None,
+                "is_rare_segment": False,
+            }
+            for col, default in column_defaults.items():
+                params[col] = filtered_stats.get(col, default)
 
-                # Гарантируем, что NOT NULL колонки имеют значения
-                _not_null_defaults = {
-                    "category": "unknown",
-                    "brand": "unknown",
-                    "model": "unknown",
-                    "condition": "unknown",
-                    "location": "unknown",
-                    "seller_type": "unknown",
-                }
-                filtered_stats = {
-                    k: v for k, v in stats.items() if hasattr(SegmentStats, k)
-                }
-                for col, default in _not_null_defaults.items():
-                    filtered_stats.setdefault(col, default)
-                    if filtered_stats[col] is None:
-                        filtered_stats[col] = default
+            # SQL-запрос с атомарным UPSERT через ON CONFLICT (segment_key)
+            # Уникальный индекс uq_segment_stats_key на segment_key
+            sql = text("""
+                INSERT INTO segment_stats (
+                    search_id, segment_key,
+                    segment_name, category, brand, model,
+                    condition, location, seller_type,
+                    median_7d, median_30d, median_90d,
+                    mean_price, min_price, max_price,
+                    price_trend_slope, std_dev,
+                    sample_size, listing_count, ad_count,
+                    appearance_count_90d,
+                    median_days_on_market,
+                    listing_price_median, fast_sale_price_median,
+                    liquid_market_estimate, is_rare_segment,
+                    calculated_at, updated_at
+                ) VALUES (
+                    :search_id, :segment_key,
+                    :segment_name, :category, :brand, :model,
+                    :condition, :location, :seller_type,
+                    :median_7d, :median_30d, :median_90d,
+                    :mean_price, :min_price, :max_price,
+                    :price_trend_slope, :std_dev,
+                    :sample_size, :listing_count, :ad_count,
+                    :appearance_count_90d,
+                    :median_days_on_market,
+                    :listing_price_median, :fast_sale_price_median,
+                    :liquid_market_estimate, :is_rare_segment,
+                    NOW(), NOW()
+                )
+                ON CONFLICT (segment_key) DO UPDATE SET
+                    search_id = EXCLUDED.search_id,
+                    segment_name = EXCLUDED.segment_name,
+                    category = EXCLUDED.category,
+                    brand = EXCLUDED.brand,
+                    model = EXCLUDED.model,
+                    condition = EXCLUDED.condition,
+                    location = EXCLUDED.location,
+                    seller_type = EXCLUDED.seller_type,
+                    median_7d = EXCLUDED.median_7d,
+                    median_30d = EXCLUDED.median_30d,
+                    median_90d = EXCLUDED.median_90d,
+                    mean_price = EXCLUDED.mean_price,
+                    min_price = EXCLUDED.min_price,
+                    max_price = EXCLUDED.max_price,
+                    price_trend_slope = EXCLUDED.price_trend_slope,
+                    std_dev = EXCLUDED.std_dev,
+                    sample_size = EXCLUDED.sample_size,
+                    listing_count = EXCLUDED.listing_count,
+                    ad_count = EXCLUDED.ad_count,
+                    appearance_count_90d = EXCLUDED.appearance_count_90d,
+                    median_days_on_market = EXCLUDED.median_days_on_market,
+                    listing_price_median = EXCLUDED.listing_price_median,
+                    fast_sale_price_median = EXCLUDED.fast_sale_price_median,
+                    liquid_market_estimate = EXCLUDED.liquid_market_estimate,
+                    is_rare_segment = EXCLUDED.is_rare_segment,
+                    calculated_at = NOW(),
+                    updated_at = NOW()
+                RETURNING id
+            """)
 
-                new_stats = SegmentStats(
-                    search_id=search_id,
-                    segment_key=segment_key,
-                    **filtered_stats,
-                )
-                self.session.add(new_stats)
-                self.session.flush()
-                logger.info(
-                    "segment_stats_created",
-                    search_id=search_id,
-                    segment_key=segment_key,
-                    stats_id=new_stats.id,
-                )
-                savepoint.commit()
-                return new_stats
-            except Exception as inner_exc:
-                savepoint.rollback()
-                raise inner_exc
+            result = self.session.execute(sql, params)
+            stats_id = result.scalar_one()
+            # Загружаем объект
+            segment_stats = self.session.get(SegmentStats, stats_id)
+            # Сессия гарантированно содержит объект, т.к. он только что вставлен/обновлён
+            logger.info(
+                "segment_stats_upserted",
+                search_id=search_id,
+                segment_key=segment_key,
+                stats_id=stats_id,
+            )
+            return segment_stats
         except SQLAlchemyError as exc:
             logger.error(
                 "upsert_segment_stats_failed",
